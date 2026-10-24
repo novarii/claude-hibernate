@@ -8,6 +8,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use crate::args::find_real_claude;
+use crate::herdr;
 use crate::state::{Config, Status, config_path, now, shim_dir};
 
 fn rss_kb(pid: u32) -> u64 {
@@ -33,17 +34,26 @@ fn mb(kb: u64) -> String {
     if kb >= 1024 * 1024 { format!("{:.1} GB", kb as f64 / 1048576.0) } else { format!("{} MB", kb / 1024) }
 }
 
-pub fn status(json: bool) -> Result<()> {
+pub fn status(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", serde_json::to_string_pretty(&Status::load_all())?);
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--watch") {
+        return watch();
+    }
+    print!("{}", status_table());
+    Ok(())
+}
+
+fn status_table() -> String {
+    use std::fmt::Write;
     let sessions = Status::load_all();
-    if json {
-        println!("{}", serde_json::to_string_pretty(&sessions)?);
-        return Ok(());
-    }
     if sessions.is_empty() {
-        println!("no wrapped sessions running");
-        return Ok(());
+        return "no wrapped sessions running\n".into();
     }
-    println!("{:>8}  {:<7} {:>7} {:>8}  {:<28} TITLE", "PID", "STATE", "FOR", "MEMORY", "HELD BY");
+    let mut out = String::new();
+    let _ = writeln!(out, "{:>8}  {:<7} {:>7} {:>8}  {:<28} TITLE", "PID", "STATE", "FOR", "MEMORY", "HELD BY");
     let (mut asleep, mut freed, mut used) = (0, 0u64, 0u64);
     for s in &sessions {
         let wrapper = rss_kb(s.pid);
@@ -55,7 +65,8 @@ pub fn status(json: bool) -> Result<()> {
             freed += s.freed_kb;
         }
         let title: String = s.title.chars().take(50).collect();
-        println!(
+        let _ = writeln!(
+            out,
             "{:>8}  {:<7} {:>7} {:>8}  {:<28} {}",
             s.pid,
             state,
@@ -65,13 +76,60 @@ pub fn status(json: bool) -> Result<()> {
             title
         );
     }
-    println!(
+    let _ = writeln!(
+        out,
         "\n{} sessions, {asleep} asleep · using {} · freed {}",
         sessions.len(),
         mb(used),
         mb(freed)
     );
-    Ok(())
+    out
+}
+
+fn term_cols() -> usize {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0;
+    if ok { ws.ws_col as usize } else { 120 }
+}
+
+/// Redraw the table every 2 s until `q`, Esc or Ctrl+C.
+fn watch() -> Result<()> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use nix::sys::termios::{self, SetArg};
+    use std::io::Write;
+    use std::os::fd::BorrowedFd;
+    let stdin = unsafe { BorrowedFd::borrow_raw(0) };
+    let saved = termios::tcgetattr(stdin).ok();
+    if let Some(t) = &saved {
+        let mut raw = t.clone();
+        termios::cfmakeraw(&mut raw);
+        let _ = termios::tcsetattr(stdin, SetArg::TCSANOW, &raw);
+    }
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b[?1049h\x1b[?25l");
+    let result = (|| -> Result<()> {
+        loop {
+            // Trim to the terminal width so long titles don't wrap and break the table.
+            let cols = term_cols();
+            let table: String = status_table().lines().map(|l| l.chars().take(cols).collect::<String>() + "\r\n").collect();
+            write!(stdout, "\x1b[H\x1b[2J{table}\r\nq to close · refreshes every 2 s\r\n")?;
+            stdout.flush()?;
+            let mut fds = [PollFd::new(stdin, PollFlags::POLLIN)];
+            if poll(&mut fds, PollTimeout::from(2000u16)).unwrap_or(0) > 0 {
+                let mut buf = [0u8; 16];
+                let n = nix::unistd::read(0, &mut buf).unwrap_or(0);
+                if n == 0 || buf[..n].iter().any(|&b| matches!(b, b'q' | b'Q' | 3 | 27)) {
+                    return Ok(());
+                }
+            }
+        }
+    })();
+    let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
+    let _ = stdout.flush();
+    if let Some(t) = &saved {
+        let _ = termios::tcsetattr(stdin, SetArg::TCSANOW, t);
+    }
+    result
 }
 
 fn targets(sel: &[String]) -> Result<Vec<Status>> {
@@ -82,10 +140,21 @@ fn targets(sel: &[String]) -> Result<Vec<Status>> {
     if sel.iter().any(|s| s == "all") {
         return Ok(all);
     }
+    // `--current` is the herdr pane this runs in (or the focused one, for plugin actions).
+    let current = std::env::var("HERDR_PANE_ID").ok();
+    let sel: Vec<String> = sel
+        .iter()
+        .map(|q| if q == "--current" { current.clone().unwrap_or_default() } else { q.clone() })
+        .collect();
     let picked: Vec<Status> = all
         .into_iter()
         .filter(|s| {
-            sel.iter().any(|q| q == &s.pid.to_string() || s.session_id.as_deref().is_some_and(|id| id.starts_with(q.as_str())))
+            sel.iter().any(|q| {
+                !q.is_empty()
+                    && (q == &s.pid.to_string()
+                        || s.herdr_pane.as_deref() == Some(q.as_str())
+                        || s.session_id.as_deref().is_some_and(|id| id.starts_with(q.as_str())))
+            })
         })
         .collect();
     if picked.is_empty() {
@@ -97,22 +166,51 @@ fn targets(sel: &[String]) -> Result<Vec<Status>> {
 /// SIGUSR1 asks a wrapper to hibernate now (still subject to its guards);
 /// SIGUSR2 wakes it.
 pub fn signal(sel: &[String], wake: bool) -> Result<()> {
-    for s in targets(sel)? {
+    let found = match targets(sel) {
+        Ok(found) => found,
+        Err(e) => {
+            herdr::notify("claude-hibernate", &format!("{e:#}"));
+            return Err(e);
+        }
+    };
+    let mut asked = vec![];
+    for s in found {
         if wake != s.asleep {
             continue;
         }
         kill(Pid::from_raw(s.pid as i32), if wake { Signal::SIGUSR2 } else { Signal::SIGUSR1 })?;
         println!("{} {} {}", if wake { "waking" } else { "asked to sleep:" }, s.pid, s.title);
+        asked.push(s.pid);
     }
-    if !wake {
-        let asked = now();
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        for s in targets(sel)?.into_iter().filter(|s| !s.asleep) {
-            if let Some((_, why)) = s.refused.filter(|(at, _)| *at >= asked - 1.0) {
-                println!("  {} stays awake: {why}", s.pid);
-            }
+    if wake {
+        let body = match asked.len() {
+            0 => "nothing asleep there".to_string(),
+            1 => "resuming the session".to_string(),
+            n => format!("resuming {n} sessions"),
+        };
+        herdr::notify("claude-hibernate", &body);
+        return Ok(());
+    }
+    let at = now();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let mut held = vec![];
+    for s in targets(sel)?.into_iter().filter(|s| asked.contains(&s.pid) && !s.asleep) {
+        if let Some((_, why)) = s.refused.filter(|(when, _)| *when >= at - 1.0) {
+            println!("  {} stays awake: {why}", s.pid);
+            held.push(why);
         }
     }
+    let sleeping = asked.len() - held.len();
+    let body = if asked.is_empty() {
+        "nothing awake to hibernate".to_string()
+    } else if held.is_empty() {
+        format!("hibernating {sleeping} session{}", if sleeping == 1 { "" } else { "s" })
+    } else if asked.len() == 1 {
+        format!("stays awake: {}", held[0])
+    } else {
+        format!("hibernating {sleeping}; {} stay awake ({})", held.len(), held.join("; "))
+    };
+    herdr::notify("claude-hibernate", &body);
     Ok(())
 }
 

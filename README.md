@@ -74,6 +74,8 @@ $ claude-hibernate status
 ```
 claude-hibernate sleep <pid|id|all>   hibernate now
 claude-hibernate wake  <pid|id|all>   resume without switching tabs
+claude-hibernate status --watch       live view
+claude-hibernate migrate --dry-run    herdr: which running agents can move under the wrapper
 claude-hibernate config               show settings
 claude-hibernate uninstall
 ```
@@ -96,6 +98,25 @@ replays what you typed. Ctrl+Z, `fg`, resizing, and `claude -p` all work as usua
 
 Works in any terminal, tmux, or SSH session. Inside [herdr](https://herdr.dev),
 sleeping agents keep their name, get a 💤 label, and wake on `herdr agent prompt`.
+
+## herdr plugin
+
+In [herdr](https://herdr.dev), install it as a plugin instead (needs `cargo`):
+
+```sh
+herdr plugin install novarii/claude-hibernate
+```
+
+Then run **Set up the claude-hibernate shim** once. The plugin adds:
+
+- **Hibernate this Claude agent** / **Wake this Claude agent** on the focused pane
+- **Hibernate all idle Claude agents**, with a note for any that stay awake and why
+- **Claude hibernation status**: a live popup of sessions, memory, and what holds them
+- **Move running Claude agents under claude-hibernate**: lists the agents it can
+  move, asks, then restarts each in place with its session and name. It skips any
+  with unsent text, background work, or a pending `/loop` or cron job.
+
+`claude-hibernate migrate --dry-run` shows the same list from a terminal.
 
 ## Credits
 

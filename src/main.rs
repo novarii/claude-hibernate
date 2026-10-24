@@ -10,6 +10,7 @@ mod cli;
 mod herdr;
 mod hook;
 mod leader;
+mod migrate;
 mod session;
 mod state;
 
@@ -22,9 +23,11 @@ claude-hibernate: free the memory of idle Claude Code sessions
 usage:
   claude [args...]                   via the shim: run Claude, hibernate when idle
   claude-hibernate run [args...]     same, without the shim
-  claude-hibernate status [--json]   wrapped sessions, their state and memory
-  claude-hibernate sleep <pid|id|all>  hibernate now (if nothing holds it awake)
-  claude-hibernate wake <pid|id|all>   resume a hibernated session
+  claude-hibernate status [--json|--watch]  wrapped sessions, their state and memory
+  claude-hibernate sleep <pid|id|pane|--current|all>  hibernate now (if nothing holds it awake)
+  claude-hibernate wake <pid|id|pane|--current|all>   resume a hibernated session
+  claude-hibernate migrate [--dry-run|--confirm] [--only PANE...] [--exclude PANE...]
+                                     move claude agents already running in herdr panes under the wrapper
   claude-hibernate install [--write-rc]  put the `claude` shim on PATH
   claude-hibernate uninstall
   claude-hibernate config            show the effective config
@@ -63,7 +66,8 @@ fn main() {
                 Ok(0)
             }
             "hook" if tail.len() == 1 => hook::run(Path::new(&tail[0])).map(|_| 0),
-            "status" => cli::status(tail.iter().any(|a| a == "--json")).map(|_| 0),
+            "status" => cli::status(&tail).map(|_| 0),
+            "migrate" => migrate::run(&tail),
             "sleep" => cli::signal(&tail, false).map(|_| 0),
             "wake" => cli::signal(&tail, true).map(|_| 0),
             "install" => cli::install(tail.iter().any(|a| a == "--write-rc")).map(|_| 0),

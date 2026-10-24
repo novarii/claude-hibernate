@@ -13,6 +13,16 @@ fn herdr(args: &[&str]) {
     let _ = Command::new("herdr").args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
+/// A toast in herdr, for results of plugin actions (which have no terminal).
+pub fn notify(title: &str, body: &str) {
+    if std::env::var_os("HERDR_PLUGIN_ID").is_none() {
+        return;
+    }
+    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
+    let _ = Command::new(bin).args(["notification", "show", title, "--body", body])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+}
+
 pub fn mark_asleep() {
     if let Some(p) = pane() {
         herdr(&["pane", "report-metadata", &p, "--source", "claude-hibernate", "--agent", "claude", "--state-label", "idle=💤 hibernated"]);

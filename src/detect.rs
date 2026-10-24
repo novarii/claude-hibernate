@@ -332,6 +332,14 @@ pub fn prompt_box_body(content: &str) -> Option<&str> {
     Some(&content[line_offset(content, &lines, top + 1)..line_offset(content, &lines, end)])
 }
 
+/// Whether a prompt box body (from `prompt_box_body`) holds nothing typed.
+/// An empty prompt may show a dimmed suggestion, `Try "fix lint errors"`,
+/// which reads as text once the styling is gone.
+pub fn prompt_is_empty(body: &str) -> bool {
+    let text = body.trim().trim_start_matches('❯').trim();
+    text.is_empty() || (text.starts_with("Try \"") && text.ends_with('"') && !text.contains('\n'))
+}
+
 fn above_prompt_box(content: &str) -> &str {
     let lines: Vec<&str> = content.lines().collect();
     match prompt_box_top(&lines) {
@@ -383,6 +391,14 @@ mod tests {
     fn interrupt_hint_is_working() {
         let screen = "✻ Sautéing… (12s · ↓ 300 tokens)\n────────\n❯\n────────\n  ⏸ plan mode on · esc to interrupt";
         assert_eq!(bundled().detect(screen, "").state, State::Working);
+    }
+
+    #[test]
+    fn suggestion_is_an_empty_prompt() {
+        assert!(prompt_is_empty("❯\n"));
+        assert!(prompt_is_empty("❯ Try \"fix lint errors\"\n"));
+        assert!(!prompt_is_empty("❯ fix the redirect\n"));
+        assert!(!prompt_is_empty("❯ '\n"));
     }
 
     #[test]

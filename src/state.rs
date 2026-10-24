@@ -176,6 +176,14 @@ impl Status {
     }
 }
 
+/// Where Claude Code keeps a session's conversation, if it has saved one.
+pub fn transcript_path(session_id: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home().join(".claude"));
+    fs::read_dir(dir.join("projects")).ok()?.flatten()
+        .map(|d| d.path().join(format!("{session_id}.jsonl")))
+        .find(|p| p.exists())
+}
+
 pub fn write_atomic(path: &Path, data: &[u8]) {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     if let Ok(mut f) = File::create(&tmp)

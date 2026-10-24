@@ -31,6 +31,15 @@ const SESSION_FLAGS: &[&str] = &[
     "--teleport", "--worktree", "-w",
 ];
 
+/// Quote for a POSIX shell, leaving plain words as they are.
+pub fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-=:@".contains(c)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
 /// Only interactive TTY sessions are wrapped; everything else execs claude.
 pub fn wants_wrapping(args: &[String]) -> bool {
     let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };

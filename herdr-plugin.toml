@@ -1,0 +1,77 @@
+id = "novarii.claude-hibernate"
+name = "claude-hibernate"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Hibernate idle Claude Code agents (~300 MB to ~2 MB each) and wake them on the first keystroke"
+platforms = ["linux", "macos"]
+
+# Installs the claude-hibernate binary into cargo's bin directory, which stays
+# put across plugin updates (the `claude` shim points at it). Needs cargo.
+[[build]]
+command = ["cargo", "install", "--path", ".", "--locked"]
+
+[[actions]]
+id = "hibernate"
+title = "Hibernate this Claude agent"
+description = "Put the focused Claude Code session to sleep now, unless something holds it awake"
+contexts = ["pane"]
+command = ["sh", "herdr/run.sh", "sleep", "--current"]
+
+[[actions]]
+id = "wake"
+title = "Wake this Claude agent"
+description = "Resume the focused hibernated Claude Code session"
+contexts = ["pane"]
+command = ["sh", "herdr/run.sh", "wake", "--current"]
+
+[[actions]]
+id = "hibernate-all"
+title = "Hibernate all idle Claude agents"
+description = "Put every wrapped Claude Code session to sleep that nothing holds awake"
+contexts = ["global"]
+command = ["sh", "herdr/run.sh", "sleep", "all"]
+
+[[actions]]
+id = "status"
+title = "Claude hibernation status"
+description = "Which sessions are asleep, the memory they freed, and what keeps the others awake"
+contexts = ["global"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint status"]
+
+[[actions]]
+id = "migrate"
+title = "Move running Claude agents under claude-hibernate"
+description = "Lists the agents that can be moved, asks, then restarts each one in place with its session"
+contexts = ["global"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint migrate"]
+
+[[actions]]
+id = "install-shim"
+title = "Set up the claude-hibernate shim"
+description = "Put the `claude` shim on PATH (adds one line to your shell rc) so new sessions hibernate"
+contexts = ["global"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint install-shim"]
+
+[[panes]]
+id = "status"
+title = "Claude hibernation"
+placement = "popup"
+width = "80%"
+height = "70%"
+command = ["sh", "herdr/run.sh", "status", "--watch"]
+
+[[panes]]
+id = "migrate"
+title = "Move Claude agents under claude-hibernate"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["sh", "herdr/run.sh", "--pause", "migrate", "--confirm"]
+
+[[panes]]
+id = "install-shim"
+title = "Set up the claude-hibernate shim"
+placement = "popup"
+width = 100
+height = 20
+command = ["sh", "herdr/run.sh", "--pause", "install", "--write-rc"]

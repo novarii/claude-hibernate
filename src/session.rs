@@ -40,8 +40,24 @@ const READY_QUIET: Duration = Duration::from_millis(400);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const KILL_GRACE: Duration = Duration::from_secs(15);
 /// Turn off the terminal modes claude may have left on: kitty keyboard,
-/// bracketed paste, mouse reporting, alternate screen; show the cursor.
-const RESET_MODES: &str = "\x1b[<u\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[?25h\x1b[0m";
+/// bracketed paste, mouse and focus reporting, alternate screen; show the cursor.
+const RESET_MODES: &str = "\x1b[<u\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?1049l\x1b[?25h\x1b[0m";
+
+/// Input the terminal generates on its own: focus in and out. It must not
+/// count as a keystroke (or the session wakes when its pane is focused).
+fn without_terminal_reports(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i..].starts_with(b"\x1b[I") || data[i..].starts_with(b"\x1b[O") {
+            i += 3;
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
+}
 
 /// Keeps the window title claude sets (OSC 0/2); vt100 reports it by callback.
 #[derive(Default)]
@@ -192,7 +208,7 @@ fn child_of(parent: Pid) -> Option<Pid> {
 
 /// Background Bash/Monitor commands run as `bash -c source
 /// .../shell-snapshots/...` under claude; MCP servers do not.
-fn has_tool_processes(pid: Pid) -> bool {
+pub(crate) fn has_tool_processes(pid: Pid) -> bool {
     let Ok(o) = Command::new("ps").args(["-A", "-o", "ppid=,args="]).output() else { return false };
     String::from_utf8_lossy(&o.stdout).lines().any(|l| {
         let l = l.trim_start();
@@ -374,7 +390,10 @@ impl Session {
 
     fn on_input(&mut self, data: &[u8]) {
         if self.asleep {
-            self.wake(data.to_vec());
+            let keys = without_terminal_reports(data);
+            if !keys.is_empty() {
+                self.wake(keys);
+            }
         } else if let Some(w) = &mut self.waking {
             w.held_input.extend_from_slice(data);
         } else if let Some(child) = &self.child
@@ -496,9 +515,7 @@ impl Session {
             let drawn = detect::prompt_box_body(&text).is_some() && self.detect().state == detect::State::Idle;
             if (started && quiet && drawn) || w.since.elapsed() >= READY_TIMEOUT {
                 let w = self.waking.take().unwrap();
-                if let Some(c) = &self.child {
-                    replay(c.master.as_raw_fd(), &w.held_input);
-                }
+                self.replay(&w.held_input);
                 if !w.held_input.is_empty() {
                     self.last_input_at = now();
                 }
@@ -557,8 +574,13 @@ impl Session {
             return Some("--settings passed; cannot track timers".into());
         }
         let hooks = self.hooks();
-        if hooks.session_id.is_none() {
+        let Some(id) = hooks.session_id.as_deref() else {
             return Some("no session id yet".into());
+        };
+        // Resuming needs the saved conversation; a session can also switch to
+        // another one (Claude's agents panel) without a new SessionStart.
+        if crate::state::transcript_path(id).is_none() {
+            return Some("no saved conversation for this session".into());
         }
         let timers = hooks.pending_timers();
         if !timers.is_empty() {
@@ -577,7 +599,7 @@ impl Session {
         if self.last_input_at > hooks.last_submit {
             let text = self.screen_text();
             let empty = detect::prompt_box_body(&text)
-                .is_some_and(|body| body.chars().all(|c| c.is_whitespace() || c == '❯'));
+                .is_some_and(detect::prompt_is_empty);
             if !empty {
                 return Some("unsent text in the prompt".into());
             }
@@ -613,6 +635,37 @@ impl Session {
         let _ = kill(pid, Signal::SIGTERM);
     }
 
+    /// Write input held during a resume. Claude reads text and Enter arriving
+    /// in one chunk as a paste, where Enter is a newline rather than submit, so
+    /// each Enter goes in its own write after a pause, as if typed.
+    ///
+    /// Before each Enter, look at the screen: if the text went into Claude's
+    /// agents panel instead of the prompt (keyboard focus can sit on the panel
+    /// with nothing on screen showing it), Enter would start a background agent
+    /// task. Close the panel and drop the rest rather than submit there.
+    fn replay(&mut self, data: &[u8]) {
+        let Some(fd) = self.child.as_ref().map(|c| c.master.as_raw_fd()) else { return };
+        let mut buf = vec![0u8; 64 * 1024];
+        let (mut start, mut i) = (0, 0);
+        while i < data.len() {
+            let Some(enter) = ENTERS.iter().find(|e| data[i..].starts_with(e)) else {
+                i += 1;
+                continue;
+            };
+            write_all(fd, &data[start..i]);
+            std::thread::sleep(Duration::from_millis(250));
+            self.pump_output(&mut buf);
+            if agents_panel_open(&self.screen_text()) {
+                write_all(fd, b"\x1b");
+                return;
+            }
+            write_all(fd, enter);
+            i += enter.len();
+            start = i;
+        }
+        write_all(fd, &data[start..]);
+    }
+
     fn draw_sleep_screen(&self) {
         let title = &self.status.title;
         let mut s = String::new();
@@ -641,6 +694,12 @@ impl Session {
 
     fn wake(&mut self, held_input: Vec<u8>) {
         let Some(id) = self.status.session_id.clone() else { return };
+        if let Some(log) = std::env::var_os("CLAUDE_HIBERNATE_LOG") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+                let _ = writeln!(f, "{:.3} wake input {:?}", now(), String::from_utf8_lossy(&held_input));
+            }
+        }
         self.asleep = false;
         self.status.asleep = false;
         self.status.freed_kb = 0;
@@ -663,28 +722,15 @@ impl Session {
     }
 }
 
+/// Claude's agents panel, open for a new task: typing there and pressing
+/// Enter starts a background agent rather than sending a prompt.
+fn agents_panel_open(screen: &str) -> bool {
+    let s = screen.to_lowercase();
+    s.contains("describe a task for a new session") || (s.contains("enter to return") && s.contains("space to reply"))
+}
+
 /// Enter as a terminal sends it: CR, or kitty-protocol CSI 13 u.
 const ENTERS: &[&[u8]] = &[b"\r", b"\x1b[13u", b"\x1b[13;1u"];
-
-/// Write input held during a resume. Claude reads text and Enter arriving in
-/// one chunk as a paste, where Enter is a newline rather than submit, so each
-/// Enter goes in its own write after a pause, as if typed.
-fn replay(fd: RawFd, data: &[u8]) {
-    let mut start = 0;
-    let mut i = 0;
-    while i < data.len() {
-        if let Some(enter) = ENTERS.iter().find(|e| data[i..].starts_with(e)) {
-            write_all(fd, &data[start..i]);
-            std::thread::sleep(Duration::from_millis(250));
-            write_all(fd, enter);
-            i += enter.len();
-            start = i;
-        } else {
-            i += 1;
-        }
-    }
-    write_all(fd, &data[start..]);
-}
 
 /// Local "Oct 23 14:05" without pulling in a date crate.
 fn chrono_like(ts: f64) -> String {
@@ -695,4 +741,26 @@ fn chrono_like(ts: f64) -> String {
     let fmt = c"%b %d %H:%M";
     let n = unsafe { libc::strftime(buf.as_mut_ptr() as *mut _, buf.len(), fmt.as_ptr(), &tm) };
     String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_reports_are_not_keystrokes() {
+        assert!(without_terminal_reports(b"\x1b[I").is_empty());
+        assert!(without_terminal_reports(b"\x1b[O\x1b[I").is_empty());
+        assert_eq!(without_terminal_reports(b"\x1b[Ifix"), b"fix");
+        assert_eq!(without_terminal_reports(b"\x1b[A"), b"\x1b[A"); // arrow keys still wake
+    }
+
+    #[test]
+    fn detects_the_agents_panel() {
+        // As drawn by Claude 2.1.30x when text lands in the panel.
+        let panel = "──────\n❯ describe a task for a new session\n──────\n  ⏵⏵ bypass permissions · enter to return · space to reply · ctrl+x to delete · ? for shortcuts";
+        assert!(agents_panel_open(panel));
+        let prompt = "──────\n❯ fix the redirect\n──────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 3 agents";
+        assert!(!agents_panel_open(prompt));
+    }
 }

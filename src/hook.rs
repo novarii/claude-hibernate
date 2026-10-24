@@ -10,6 +10,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::args::shell_quote;
 use crate::state::{now, write_atomic, HookState};
 
 /// Tools whose PostToolUse results we track.
@@ -23,14 +24,6 @@ pub fn settings_json(exe: &str, state_path: &Path) -> String {
     let hook = serde_json::json!([{ "hooks": [{ "type": "command", "command": cmd }] }]);
     let tools = serde_json::json!([{ "matcher": TIMER_TOOLS, "hooks": [{ "type": "command", "command": cmd }] }]);
     serde_json::json!({ "hooks": { "SessionStart": hook, "UserPromptSubmit": hook, "PostToolUse": tools } }).to_string()
-}
-
-fn shell_quote(s: &str) -> String {
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c)) {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
 }
 
 pub fn run(state_path: &Path) -> anyhow::Result<()> {
@@ -48,7 +41,7 @@ pub fn run(state_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn apply(state: &mut HookState, event: &Value, now: f64) {
+pub(crate) fn apply(state: &mut HookState, event: &Value, now: f64) {
     match event["hook_event_name"].as_str().unwrap_or("") {
         "SessionStart" => {
             if event["agent_id"].is_string() {
