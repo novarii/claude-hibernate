@@ -102,12 +102,13 @@ pub fn signal(sel: &[String], wake: bool) -> Result<()> {
             continue;
         }
         kill(Pid::from_raw(s.pid as i32), if wake { Signal::SIGUSR2 } else { Signal::SIGUSR1 })?;
-        println!("{} {} {}", if wake { "waking" } else { "hibernating" }, s.pid, s.title);
+        println!("{} {} {}", if wake { "waking" } else { "asked to sleep:" }, s.pid, s.title);
     }
     if !wake {
+        let asked = now();
         std::thread::sleep(std::time::Duration::from_millis(1500));
         for s in targets(sel)?.into_iter().filter(|s| !s.asleep) {
-            if let Some(why) = s.held_by {
+            if let Some((_, why)) = s.refused.filter(|(at, _)| *at >= asked - 1.0) {
                 println!("  {} stays awake: {why}", s.pid);
             }
         }

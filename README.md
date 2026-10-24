@@ -97,11 +97,21 @@ replays what you typed. Ctrl+Z, `fg`, resizing, and `claude -p` all work as usua
 Works in any terminal, tmux, or SSH session. Inside [herdr](https://herdr.dev),
 sleeping agents keep their name, get a 💤 label, and wake on `herdr agent prompt`.
 
+## Credits
+
+Telling whether Claude is working, idle, or waiting on a dialog uses the
+agent-detection rules from [herdr](https://github.com/herdrdev/herdr)
+(Apache-2.0), which are kept up to date as Claude Code's interface changes.
+claude-hibernate bundles them and refreshes them daily. See [NOTICE](NOTICE).
+
 ## Limitations
 
 - Linux and macOS.
 - Waking takes as long as `claude --resume`, about 2–3 seconds.
 - Sessions started with your own `--settings` flag never hibernate.
+- A new Claude Code dialog that the detection rules don't know yet could look
+  idle until the rules are updated. Prompts you've typed are still protected,
+  since drafts are tracked from your keystrokes.
 
 ---
 

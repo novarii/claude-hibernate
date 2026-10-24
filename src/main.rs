@@ -5,11 +5,11 @@
 //! Invoked as `claude-hibernate` it is the management CLI.
 
 mod args;
+mod detect;
 mod cli;
 mod herdr;
 mod hook;
 mod leader;
-mod screen;
 mod session;
 mod state;
 
@@ -54,6 +54,14 @@ fn main() {
         match cmd {
             "run" => shim(tail),
             "__pty-leader" if !tail.is_empty() => Ok(leader::run(&tail[0], &tail[1..])),
+            "__detect" => {
+                // Debug: classify a screen read from stdin; optional window title arg.
+                let mut screen = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut screen).ok();
+                let d = detect::claude().detect(&screen, tail.first().map(String::as_str).unwrap_or(""));
+                println!("{:?} {}", d.state, d.rule.unwrap_or_default());
+                Ok(0)
+            }
             "hook" if tail.len() == 1 => hook::run(Path::new(&tail[0])).map(|_| 0),
             "status" => cli::status(tail.iter().any(|a| a == "--json")).map(|_| 0),
             "sleep" => cli::signal(&tail, false).map(|_| 0),

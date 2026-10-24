@@ -1,5 +1,6 @@
 //! `claude-hibernate hook <state-file>`: run by Claude Code hooks that the
-//! wrapper injects with `--settings`. Records the session id and the timers
+//! wrapper injects with `--settings`. Records the session id, when a prompt
+//! was last submitted (for draft detection), and the timers
 //! that only live inside the claude process (/loop wake-ups, cron jobs), so the
 //! wrapper never kills a session that still has work scheduled.
 
@@ -21,7 +22,7 @@ pub fn settings_json(exe: &str, state_path: &Path) -> String {
     let cmd = format!("{} hook {}", shell_quote(exe), shell_quote(&state_path.to_string_lossy()));
     let hook = serde_json::json!([{ "hooks": [{ "type": "command", "command": cmd }] }]);
     let tools = serde_json::json!([{ "matcher": TIMER_TOOLS, "hooks": [{ "type": "command", "command": cmd }] }]);
-    serde_json::json!({ "hooks": { "SessionStart": hook, "PostToolUse": tools } }).to_string()
+    serde_json::json!({ "hooks": { "SessionStart": hook, "UserPromptSubmit": hook, "PostToolUse": tools } }).to_string()
 }
 
 fn shell_quote(s: &str) -> String {
@@ -58,6 +59,7 @@ fn apply(state: &mut HookState, event: &Value, now: f64) {
             }
             state.session_starts += 1;
         }
+        "UserPromptSubmit" => state.last_submit = now,
         "PostToolUse" => {
             let input = &event["tool_input"];
             let response = &event["tool_response"];

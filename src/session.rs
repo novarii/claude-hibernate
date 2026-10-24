@@ -29,7 +29,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::state::{Config, HookState, Status, now};
-use crate::{args, herdr, hook, screen};
+use crate::{args, detect, herdr, hook};
 
 nix::ioctl_read_bad!(get_winsize, libc::TIOCGWINSZ, Winsize);
 nix::ioctl_write_ptr_bad!(set_winsize, libc::TIOCSWINSZ, Winsize);
@@ -39,6 +39,9 @@ const TICK: Duration = Duration::from_millis(1000);
 const READY_QUIET: Duration = Duration::from_millis(400);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const KILL_GRACE: Duration = Duration::from_secs(15);
+/// Turn off the terminal modes claude may have left on: kitty keyboard,
+/// bracketed paste, mouse reporting, alternate screen; show the cursor.
+const RESET_MODES: &str = "\x1b[<u\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[?25h\x1b[0m";
 
 /// Keeps the window title claude sets (OSC 0/2); vt100 reports it by callback.
 #[derive(Default)]
@@ -133,6 +136,9 @@ pub struct Session {
     last_activity: Instant,
     last_output: Instant,
     screen_hash: u64,
+    /// When the user last typed; compared with the last submitted prompt to
+    /// tell whether text may be sitting unsent in the prompt box.
+    last_input_at: f64,
     status: Status,
     cfg: Config,
 }
@@ -215,6 +221,7 @@ impl Session {
             last_activity: Instant::now(),
             last_output: Instant::now(),
             screen_hash: 0,
+            last_input_at: 0.0,
             status: Status {
                 pid: me,
                 cwd: cwd.to_string_lossy().into_owned(),
@@ -281,6 +288,7 @@ impl Session {
 
     pub fn run(mut self) -> Result<i32> {
         let signals = Signals::install()?;
+        detect::refresh_in_background();
         self.raw_mode();
         let first_args = self.args.clone();
         if let Err(e) = self.spawn(&first_args) {
@@ -288,6 +296,7 @@ impl Session {
             return Err(e);
         }
         let code = self.event_loop(&signals);
+        out(RESET_MODES.as_bytes());
         self.cooked_mode();
         crate::state::cleanup(self.me);
         Ok(code)
@@ -372,6 +381,7 @@ impl Session {
             && child.stopping_since.is_none() {
                 write_all(child.master.as_raw_fd(), data);
                 self.last_activity = Instant::now();
+                self.last_input_at = now();
             }
     }
 
@@ -440,23 +450,33 @@ impl Session {
     }
 
     fn shutdown(&mut self, sig: Signal) -> i32 {
-        if let Some(c) = self.child.take() {
-            let _ = kill(c.pid, sig);
-            let deadline = Instant::now() + KILL_GRACE;
-            while Instant::now() < deadline {
-                match waitpid(c.pid, Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive) => std::thread::sleep(Duration::from_millis(50)),
-                    _ => return 128 + sig as i32,
+        let Some(pid) = self.child.as_ref().map(|c| c.pid) else { return 128 + sig as i32 };
+        let _ = kill(pid, sig);
+        let mut buf = vec![0u8; 64 * 1024];
+        let deadline = Instant::now() + KILL_GRACE;
+        while Instant::now() < deadline {
+            // Pass claude's cleanup output through so it can restore the terminal.
+            self.pump_output(&mut buf);
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => std::thread::sleep(Duration::from_millis(50)),
+                _ => {
+                    self.pump_output(&mut buf);
+                    return 128 + sig as i32;
                 }
             }
-            let _ = kill(c.pid, Signal::SIGKILL);
         }
+        let _ = kill(pid, Signal::SIGKILL);
         128 + sig as i32
     }
 
-    fn screen_lines(&self) -> Vec<String> {
+    /// The visible screen as plain text, the input herdr's rules expect.
+    fn screen_text(&self) -> String {
         let s = self.parser.screen();
-        s.rows(0, s.size().1.get()).collect()
+        s.rows(0, s.size().1.get()).map(|r| r.trim_end().to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn detect(&self) -> detect::Detection {
+        detect::claude().detect(&self.screen_text(), &self.parser.callbacks().title)
     }
 
     fn title(&self) -> String {
@@ -470,11 +490,17 @@ impl Session {
         if let Some(w) = &self.waking {
             let started = self.hooks().session_starts > w.starts_before || !self.track_timers;
             let quiet = self.last_output.elapsed() >= READY_QUIET;
-            let has_prompt = self.screen_lines().iter().any(|l| l.trim_start().starts_with('❯'));
-            if (started && quiet && has_prompt) || w.since.elapsed() >= READY_TIMEOUT {
+            // Ready once claude has drawn its prompt box and is not busy. An
+            // empty screen also classifies as idle, so the box is required.
+            let text = self.screen_text();
+            let drawn = detect::prompt_box_body(&text).is_some() && self.detect().state == detect::State::Idle;
+            if (started && quiet && drawn) || w.since.elapsed() >= READY_TIMEOUT {
                 let w = self.waking.take().unwrap();
                 if let Some(c) = &self.child {
                     replay(c.master.as_raw_fd(), &w.held_input);
+                }
+                if !w.held_input.is_empty() {
+                    self.last_input_at = now();
                 }
                 self.last_activity = Instant::now();
                 herdr::mark_awake();
@@ -538,12 +564,23 @@ impl Session {
         if !timers.is_empty() {
             return Some(timers.join(", "));
         }
-        let lines = self.screen_lines();
-        if !screen::prompt_is_empty(&lines) {
-            return Some("draft or dialog on screen".into());
+        let d = self.detect();
+        if d.state != detect::State::Idle {
+            let state = format!("{:?}", d.state).to_lowercase();
+            return Some(match d.rule {
+                Some(rule) => format!("claude {state} ({rule})"),
+                None => format!("claude {state}"),
+            });
         }
-        if screen::footer_busy(&lines) {
-            return Some("background work".into());
+        // Typed since the last submitted prompt: unless the prompt box is
+        // visibly empty, assume a draft is waiting.
+        if self.last_input_at > hooks.last_submit {
+            let text = self.screen_text();
+            let empty = detect::prompt_box_body(&text)
+                .is_some_and(|body| body.chars().all(|c| c.is_whitespace() || c == '❯'));
+            if !empty {
+                return Some("unsent text in the prompt".into());
+            }
         }
         if self.child.as_ref().and_then(|c| c.claude).is_some_and(has_tool_processes) {
             return Some("background shell".into());
@@ -562,6 +599,7 @@ impl Session {
         self.status.held_by = self.held_by();
         if self.status.held_by.is_some() {
             if forced {
+                self.status.refused = Some((now(), self.status.held_by.clone().unwrap_or_default()));
                 self.status.save();
             }
             return;
@@ -580,7 +618,8 @@ impl Session {
         let mut s = String::new();
         // Undo the modes claude left on: kitty keyboard, bracketed paste,
         // mouse reporting, alternate screen; then show the cursor and clear.
-        s.push_str("\x1b[<u\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[?25h\x1b[0m\x1b[2J\x1b[H");
+        s.push_str(RESET_MODES);
+        s.push_str("\x1b[2J\x1b[H");
         s.push_str(&format!("\x1b]0;💤 {title}\x07"));
         let since = chrono_like(self.status.since);
         let freed = if self.status.freed_kb > 0 { format!(" · freed {} MB", self.status.freed_kb / 1024) } else { String::new() };

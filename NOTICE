@@ -1,0 +1,11 @@
+claude-hibernate
+Copyright (c) 2026 novarii
+
+This product includes software developed by the herdr project
+(https://github.com/herdrdev/herdr), licensed under the Apache License,
+Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0):
+
+  - manifests/claude.toml: herdr's Claude Code agent-detection manifest,
+    bundled unmodified. Updates are fetched from herdr.dev/agent-detection/.
+  - src/detect.rs: the manifest format, rule evaluation, and screen region
+    definitions, ported from herdr's src/detect/manifest.rs.

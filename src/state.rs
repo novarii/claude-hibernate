@@ -92,10 +92,13 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct HookState {
     pub session_id: Option<String>,
     /// Bumped on every SessionStart, so a resume can tell when claude is up.
     pub session_starts: u64,
+    /// When the last prompt was submitted.
+    pub last_submit: f64,
     /// A /loop wake-up is due before this time.
     pub wake_until: f64,
     /// Cron job id -> time after which it can no longer fire.
@@ -127,6 +130,7 @@ impl HookState {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Status {
     pub pid: u32,
     pub cwd: String,
@@ -137,6 +141,8 @@ pub struct Status {
     pub since: f64,
     /// Why it is being kept awake, if it is idle but not eligible.
     pub held_by: Option<String>,
+    /// The last `claude-hibernate sleep` request that was refused: (when, why).
+    pub refused: Option<(f64, String)>,
     pub child_pid: Option<u32>,
     /// claude's RSS just before it was stopped, for `status` savings.
     pub freed_kb: u64,
