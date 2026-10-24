@@ -1,0 +1,28 @@
+[package]
+name = "claude-hibernate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Free the memory of idle Claude Code sessions; resume them on the first keystroke."
+license = "MIT"
+repository = "https://github.com/novarii/claude-hibernate"
+readme = "README.md"
+keywords = ["claude", "claude-code", "memory", "terminal", "pty"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+nix = { version = "0.29", features = ["term", "process", "signal", "poll", "fs", "ioctl"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+toml = "0.8"
+vt100 = "0.18"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

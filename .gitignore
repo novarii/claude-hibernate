@@ -1,0 +1,6 @@
+/target
+# The Python prototype that this box's live sessions still run through.
+# Keep it on disk until no wrapped session uses it; don't publish it.
+/claude
+/migrate.py
+__pycache__/
