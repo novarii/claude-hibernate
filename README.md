@@ -1,12 +1,30 @@
-# claude-hibernate
+<div align="center">
 
-Idle Claude Code sessions keep their memory forever. A session sitting in a
-terminal tab you haven't touched since Tuesday still holds 250–500 MB. Run a
-few dozen across tmux windows or a box full of agents and the machine runs out
-of RAM.
+# 💤 claude-hibernate
 
-`claude-hibernate` wraps `claude`. When a session has been idle for a while,
-it stops the Claude process and leaves a small sleep screen in its place:
+### Idle Claude Code sessions: **~300 MB → 2 MB**
+
+Put idle sessions to sleep. Wake them with one keystroke.
+
+[![ci](https://github.com/novarii/claude-hibernate/actions/workflows/ci.yml/badge.svg)](https://github.com/novarii/claude-hibernate/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![platforms](https://img.shields.io/badge/platform-linux%20%7C%20macos-lightgrey)
+
+</div>
+
+---
+
+Every open Claude Code session holds **250–500 MB of RAM**, even one you
+haven't touched in days. Ten tabs is 3 GB. Fifty agents is a box that falls over.
+
+`claude-hibernate` puts idle sessions to sleep and brings them back the moment
+you need them.
+
+|                 | Awake    | Hibernated |
+|-----------------|----------|------------|
+| 1 session       | ~300 MB  | **2 MB**   |
+| 10 sessions     | ~3 GB    | **20 MB**  |
+| 50 sessions     | ~15 GB   | **100 MB** |
 
 ```
   💤  hibernated — Fix flaky auth test
@@ -17,112 +35,74 @@ it stops the Claude process and leaves a small sleep screen in its place:
   press any key to resume
 ```
 
-Press a key, or just start typing, and the same conversation comes back
-through `claude --resume`. Whatever you type while it wakes is held and passed
-through once Claude is ready, so the keystroke that woke it isn't lost.
-
-A sleeping session costs about **2 MB**.
-
-On one dev box running ~60 sessions, the memory used by Claude went from
-**17.9 GB to 4.1 GB**, with 50 sessions asleep.
+Start typing and the same conversation is back in about 2 seconds, with
+everything you typed already in the prompt.
 
 ## Install
 
 ```sh
-cargo install claude-hibernate
-claude-hibernate install --write-rc   # adds the shim dir to PATH in your shell rc
+cargo install --git https://github.com/novarii/claude-hibernate
+claude-hibernate install --write-rc
 ```
 
-`install` puts a `claude` symlink in `~/.local/share/claude-hibernate/bin` and
-records where the real `claude` is. Open a new shell and use `claude` as usual.
-Running sessions are not affected; new ones are wrapped.
+Open a new shell and use `claude` like you always do. That's it.
 
-To remove it: `claude-hibernate uninstall`, then delete the PATH line.
+## Safe by default
 
-## What keeps a session awake
+A session only sleeps when nothing can be lost. It stays awake while:
 
-It only sleeps when nothing could be lost. A session stays awake while any of
-these is true:
+- you've used it in the last 30 minutes
+- there's a draft in the prompt, or a dialog or permission prompt is open
+- Claude is working, or a background shell, Monitor, or agent is running
+- a `/loop` or scheduled cron job is pending
 
-- the screen or keyboard has been active within `idle_minutes` (default 30)
-- there is text in the prompt box, or a dialog, menu, or permission prompt is open
-- Claude is working, or a background shell, Monitor, or background agent is running
-- a `/loop` wake-up or a cron job (`CronCreate`) is pending: these timers live
-  only inside the Claude process, so stopping it would silently end the loop
-
-Timers are tracked with Claude Code hooks that the wrapper passes in with
-`--settings`; your own settings files are not modified.
+The conversation is saved as it goes, and waking resumes it with your original
+flags.
 
 ## Commands
 
 ```
-claude-hibernate status            sessions, state, memory, and what holds them awake
-claude-hibernate sleep <pid|id|all>  hibernate now (the checks above still apply)
-claude-hibernate wake <pid|id|all>   resume without typing
-claude-hibernate config            effective configuration
-claude-hibernate run [args...]     wrap one session without the shim
-```
-
-```
 $ claude-hibernate status
-     PID  STATE       FOR   MEMORY  HELD BY                      TITLE
- 3727942  asleep      2h14m   2 MB                               Fix flaky auth test
- 3729120  held        41m    318 MB  cron e3946f1b                Nightly report loop
- 3731877  awake        3m    296 MB                               Refactor billing
+     PID  STATE    FOR    MEMORY  HELD BY          TITLE
+ 3727942  asleep  2h14m     2 MB                   Fix flaky auth test
+ 3729120  held      41m   318 MB  cron e3946f1b    Nightly report loop
+ 3731877  awake      3m   296 MB                   Refactor billing
 
 3 sessions, 1 asleep · using 616 MB · freed 312 MB
 ```
 
-## Configuration
+```
+claude-hibernate sleep <pid|id|all>   hibernate now
+claude-hibernate wake  <pid|id|all>   resume without switching tabs
+claude-hibernate config               show settings
+claude-hibernate uninstall
+```
 
-`~/.config/claude-hibernate/config.toml`, re-read while sessions run:
+## Configure
+
+`~/.config/claude-hibernate/config.toml` (changes apply to running sessions):
 
 ```toml
 idle_minutes = 30
-enabled = true
-exclude_dirs = ["~/work/always-on"]   # never hibernate sessions started here
-# real_claude = "/path/to/claude"     # set by `install`; found on PATH otherwise
+exclude_dirs = ["~/work/always-on"]
 ```
-
-`CLAUDE_HIBERNATE_IDLE_SECS` and `CLAUDE_HIBERNATE_DISABLE=1` override it per
-session.
 
 ## How it works
 
-The shim runs Claude on a pseudo-terminal it owns and proxies your terminal
-to it, keeping its own copy of the screen (via `vt100`). That copy is how it
-tells an empty prompt from a draft and notices when the screen stops changing.
-Non-interactive uses (`claude -p`, `claude mcp ...`, pipes) are passed straight
-to the real binary.
+The `claude` shim runs Claude Code on a terminal it owns and passes everything
+through untouched. When the session goes idle it stops Claude and shows the
+sleep screen. On your first keystroke it runs `claude --resume <id>` and
+replays what you typed. Ctrl+Z, `fg`, resizing, and `claude -p` all work as usual.
 
-Hibernating sends Claude `SIGTERM`. Claude writes its transcript as it goes,
-so nothing in the conversation is lost. Waking runs
-`claude --resume <session-id>` with your original flags.
-
-Job control works as usual: Ctrl+Z suspends the session and `fg` brings it
-back.
-
-## herdr
-
-Inside a [herdr](https://herdr.dev) pane, the shim still shows up as a
-`claude` agent, keeps its agent name across sleep and wake, and gets a
-`💤 hibernated` label in the sidebar. `herdr agent prompt` to a sleeping agent
-wakes it and delivers the prompt.
+Works in any terminal, tmux, or SSH session. Inside [herdr](https://herdr.dev),
+sleeping agents keep their name, get a 💤 label, and wake on `herdr agent prompt`.
 
 ## Limitations
 
-- Linux and macOS only.
-- Waking takes as long as `claude --resume`, usually 2–3 seconds.
-- Sessions started with `--settings` are never hibernated, since timers can't
-  be tracked alongside your own settings flag.
-- The prompt-box and footer checks read Claude Code's UI. If a Claude Code
-  update changes it, sessions err on the side of staying awake.
-- Prompt caching is unaffected by sleeping, but a session that sat idle past
-  the cache lifetime pays for a cold cache on its next message either way.
+- Linux and macOS.
+- Waking takes as long as `claude --resume`, about 2–3 seconds.
+- Sessions started with your own `--settings` flag never hibernate.
 
-claude-hibernate is an independent project and is not affiliated with or
-endorsed by Anthropic.
+---
 
-## License
-
-MIT
+<sub>An independent project, not affiliated with or endorsed by Anthropic. MIT licensed.</sub>
