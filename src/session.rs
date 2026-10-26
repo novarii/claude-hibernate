@@ -35,8 +35,14 @@ nix::ioctl_read_bad!(get_winsize, libc::TIOCGWINSZ, Winsize);
 nix::ioctl_write_ptr_bad!(set_winsize, libc::TIOCSWINSZ, Winsize);
 
 const TICK: Duration = Duration::from_millis(1000);
+/// How often to check whether a resuming claude is ready.
+const WAKE_POLL: Duration = Duration::from_millis(50);
 /// Output must be quiet this long after SessionStart before replaying input.
-const READY_QUIET: Duration = Duration::from_millis(400);
+const READY_QUIET: Duration = Duration::from_millis(300);
+/// Show claude even though it isn't ready yet, in case it is waiting on a
+/// dialog the detection rules don't know.
+const REVEAL_AFTER: Duration = Duration::from_secs(8);
+/// Give up on replaying held input if claude isn't ready by then.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const KILL_GRACE: Duration = Duration::from_secs(15);
 /// Turn off the terminal modes claude may have left on: kitty keyboard,
@@ -135,6 +141,12 @@ struct Waking {
     since: Instant,
     starts_before: u64,
     held_input: Vec<u8>,
+    /// claude's output while it starts up and the held input is replayed.
+    /// Shown in one go once it is ready, instead of the startup flicker and
+    /// the input being retyped.
+    output: Vec<u8>,
+    /// claude's screen is showing: it wanted something from the user first.
+    revealed: bool,
 }
 
 pub struct Session {
@@ -330,7 +342,8 @@ impl Session {
             if let Some(fd) = master_fd {
                 fds.push(PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, PollFlags::POLLIN));
             }
-            let _ = poll(&mut fds, PollTimeout::from(TICK.as_millis() as u16));
+            let timeout = if self.waking.is_some() { WAKE_POLL } else { TICK };
+            let _ = poll(&mut fds, PollTimeout::from(timeout.as_millis() as u16));
             let ready = |i: usize| fds.get(i).and_then(|f| f.revents()).is_some_and(|r| !r.is_empty());
             let (stdin_ready, sig_ready, master_ready) = (ready(0), ready(1), ready(2));
             drop(fds);
@@ -364,6 +377,9 @@ impl Session {
             if take(&signals.sleep_now) {
                 self.try_hibernate(true);
             }
+            if self.waking.is_some() {
+                self.check_ready();
+            }
             if last_tick.elapsed() >= TICK {
                 last_tick = Instant::now();
                 self.tick();
@@ -373,19 +389,35 @@ impl Session {
 
     fn pump_output(&mut self, buf: &mut [u8]) {
         let Some(child) = &self.child else { return };
+        let (fd, stopping) = (child.master.as_raw_fd(), child.stopping_since.is_some());
         loop {
-            match nix::unistd::read(child.master.as_raw_fd(), buf) {
+            match nix::unistd::read(fd, buf) {
                 Ok(0) | Err(_) => return, // EAGAIN, or EIO once claude exits
                 Ok(n) => {
                     self.last_output = Instant::now();
-                    if child.stopping_since.is_some() {
+                    if stopping {
                         continue; // claude's goodbye text; the sleep screen replaces it
                     }
                     self.parser.process(&buf[..n]);
-                    out(&buf[..n]);
+                    match &mut self.waking {
+                        Some(w) if !w.revealed => w.output.extend_from_slice(&buf[..n]),
+                        _ => out(&buf[..n]),
+                    }
                 }
             }
         }
+    }
+
+    /// Stop holding claude's output back: clear the resume screen and show
+    /// everything claude drew since it started.
+    fn reveal(&mut self) {
+        if let Some(w) = &mut self.waking
+            && !w.revealed {
+                w.revealed = true;
+                out(b"\x1b[2J\x1b[H");
+                out(&std::mem::take(&mut w.output));
+                herdr::mark_awake();
+            }
     }
 
     fn on_input(&mut self, data: &[u8]) {
@@ -394,8 +426,10 @@ impl Session {
             if !keys.is_empty() {
                 self.wake(keys);
             }
-        } else if let Some(w) = &mut self.waking {
+        } else if let Some(w) = &mut self.waking
+            && !w.revealed {
             w.held_input.extend_from_slice(data);
+            self.draw_waking_screen();
         } else if let Some(child) = &self.child
             && child.stopping_since.is_none() {
                 write_all(child.master.as_raw_fd(), data);
@@ -434,6 +468,8 @@ impl Session {
     fn child_gone(&mut self, code: i32) -> Option<i32> {
         let mut buf = vec![0u8; 64 * 1024];
         self.pump_output(&mut buf); // flush claude's last words to the terminal
+        self.reveal(); // a resume that failed: show why
+        self.waking = None;
         let hibernating = self.child.as_ref().is_some_and(|c| c.stopping_since.is_some());
         self.child = None;
         self.status.child_pid = None;
@@ -470,6 +506,7 @@ impl Session {
 
     fn shutdown(&mut self, sig: Signal) -> i32 {
         let Some(pid) = self.child.as_ref().map(|c| c.pid) else { return 128 + sig as i32 };
+        self.reveal();
         let _ = kill(pid, sig);
         let mut buf = vec![0u8; 64 * 1024];
         let deadline = Instant::now() + KILL_GRACE;
@@ -505,23 +542,55 @@ impl Session {
         if t.is_empty() { self.status.session_id.clone().unwrap_or_default() } else { t.to_string() }
     }
 
-    fn tick(&mut self) {
-        if let Some(w) = &self.waking {
-            let started = self.hooks().session_starts > w.starts_before || !self.track_timers;
-            let quiet = self.last_output.elapsed() >= READY_QUIET;
-            // Ready once claude has drawn its prompt box and is not busy. An
-            // empty screen also classifies as idle, so the box is required.
-            let text = self.screen_text();
-            let drawn = detect::prompt_box_body(&text).is_some() && self.detect().state == detect::State::Idle;
-            if (started && quiet && drawn) || w.since.elapsed() >= READY_TIMEOUT {
-                let w = self.waking.take().unwrap();
-                self.replay(&w.held_input);
-                if !w.held_input.is_empty() {
-                    self.last_input_at = now();
-                }
-                self.last_activity = Instant::now();
-                herdr::mark_awake();
+    /// While resuming: once claude is ready, replay the held input, then
+    /// show the result.
+    fn check_ready(&mut self) {
+        let Some(w) = &self.waking else { return };
+        let elapsed = w.since.elapsed();
+        if self.last_output.elapsed() < READY_QUIET && elapsed < READY_TIMEOUT {
+            return;
+        }
+        let started = !self.track_timers || self.hooks().session_starts > w.starts_before;
+        // Ready once claude has drawn its prompt box and is not busy. An
+        // empty screen also classifies as idle, so the box is required.
+        let text = self.screen_text();
+        let state = self.detect().state;
+        if started && state == detect::State::Idle && detect::prompt_box_body(&text).is_some() {
+            log(&format!("ready after {:.2}s", elapsed.as_secs_f64()));
+            let held = std::mem::take(&mut self.waking.as_mut().unwrap().held_input);
+            if !held.is_empty() {
+                self.replay(&held);
+                // Let the echo of the last keys land before showing the screen.
+                std::thread::sleep(Duration::from_millis(100));
+                self.pump_output(&mut vec![0u8; 64 * 1024]);
+                self.last_input_at = now();
             }
+            self.finish_waking();
+            return;
+        }
+        // A login, trust or other dialog came up first: show it and pass keys
+        // through. The held input waits for the prompt box.
+        if state == detect::State::Blocked || elapsed >= REVEAL_AFTER {
+            if !w.revealed {
+                log(&format!("revealed after {:.2}s: claude is {state:?}", elapsed.as_secs_f64()));
+            }
+            self.reveal();
+        }
+        // Never type held keys into whatever is on screen now.
+        if elapsed >= READY_TIMEOUT {
+            log("not ready in time; held input dropped");
+            self.finish_waking();
+        }
+    }
+
+    fn finish_waking(&mut self) {
+        self.reveal();
+        self.waking = None;
+        self.last_activity = Instant::now();
+    }
+
+    fn tick(&mut self) {
+        if self.waking.is_some() {
             return;
         }
         if let Some(c) = &mut self.child
@@ -692,31 +761,45 @@ impl Session {
         out(s.as_bytes());
     }
 
+    /// Shown while claude resumes, with what has been typed so far so the
+    /// keys visibly land somewhere.
+    ///
+    /// Herdr reads Claude's state off the screen: a braille spinner title
+    /// and a `✻ …` status line count as working, so `herdr agent prompt
+    /// --wait` sees activity while the session resumes.
+    fn draw_waking_screen(&self) {
+        let cols = winsize().ws_col as usize;
+        let held = self.waking.as_ref().map(|w| typed_preview(&w.held_input)).unwrap_or_default();
+        let mut s = format!("\x1b]0;⠂ {}\x07\x1b[2J\x1b[H\r\n✻ Resuming session…\r\n", self.status.title);
+        if !held.is_empty() {
+            // Keep the end of long input in view.
+            let room = cols.saturating_sub(4).max(1);
+            let skip = held.chars().count().saturating_sub(room);
+            s.push_str("\r\n\x1b[2m❯ ");
+            s.extend(held.chars().skip(skip));
+            s.push_str("\x1b[0m\r\n");
+        }
+        out(s.as_bytes());
+    }
+
     fn wake(&mut self, held_input: Vec<u8>) {
         let Some(id) = self.status.session_id.clone() else { return };
-        if let Some(log) = std::env::var_os("CLAUDE_HIBERNATE_LOG") {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
-                let _ = writeln!(f, "{:.3} wake input {:?}", now(), String::from_utf8_lossy(&held_input));
-            }
-        }
+        log(&format!("wake input {:?}", String::from_utf8_lossy(&held_input)));
         self.asleep = false;
         self.status.asleep = false;
         self.status.freed_kb = 0;
-        // Herdr reads Claude's state off the screen: a braille spinner title
-        // and a `✻ …` status line count as working, so `herdr agent prompt
-        // --wait` sees activity while the session resumes.
-        out(format!("\x1b]0;⠂ {}\x07\x1b[2J\x1b[H\r\n✻ Resuming session…\r\n", self.status.title).as_bytes());
         let starts_before = self.hooks().session_starts;
         let mut argv = args::resume_args(&self.args);
         argv.push("--resume".into());
         argv.push(id);
+        self.waking = Some(Waking { since: Instant::now(), starts_before, held_input, output: vec![], revealed: false });
+        self.draw_waking_screen();
         if let Err(e) = self.spawn(&argv) {
+            self.waking = None;
             out(format!("\r\nclaude-hibernate: could not resume: {e:#}\r\n").as_bytes());
             self.asleep = true;
             return;
         }
-        self.waking = Some(Waking { since: Instant::now(), starts_before, held_input });
         self.status.since = now();
         self.status.save();
     }
@@ -727,6 +810,52 @@ impl Session {
 fn agents_panel_open(screen: &str) -> bool {
     let s = screen.to_lowercase();
     s.contains("describe a task for a new session") || (s.contains("enter to return") && s.contains("space to reply"))
+}
+
+/// Held keystrokes as text for the resume screen: printable characters,
+/// Enter as ⏎, backspace applied, escape sequences (arrows and the like) dropped.
+fn typed_preview(data: &[u8]) -> String {
+    let mut out = String::new();
+    let text = String::from_utf8_lossy(data);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                // A CSI or SS3 sequence runs to its final letter or `~`.
+                let mut seq = String::new();
+                if let Some(intro) = chars.next() {
+                    seq.push(intro);
+                    if matches!(intro, '[' | 'O') {
+                        for n in chars.by_ref() {
+                            seq.push(n);
+                            if n.is_ascii_alphabetic() || n == '~' {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if seq == "[13u" || seq == "[13;1u" {
+                    out.push_str(" ⏎ ");
+                }
+            }
+            '\r' | '\n' => out.push_str(" ⏎ "),
+            '\x7f' | '\x08' => {
+                out.pop();
+            }
+            c if !c.is_control() => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn log(msg: &str) {
+    if let Some(path) = std::env::var_os("CLAUDE_HIBERNATE_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{:.3} {msg}", now());
+        }
+    }
 }
 
 /// Enter as a terminal sends it: CR, or kitty-protocol CSI 13 u.
@@ -753,6 +882,13 @@ mod tests {
         assert!(without_terminal_reports(b"\x1b[O\x1b[I").is_empty());
         assert_eq!(without_terminal_reports(b"\x1b[Ifix"), b"fix");
         assert_eq!(without_terminal_reports(b"\x1b[A"), b"\x1b[A"); // arrow keys still wake
+    }
+
+    #[test]
+    fn previews_typed_input() {
+        assert_eq!(typed_preview(b"fix the testx\x7f\r"), "fix the test ⏎");
+        assert_eq!(typed_preview(b"hi\x1b[Dthere\x1b[13u"), "hithere ⏎");
+        assert_eq!(typed_preview(b"\x1b[A"), "");
     }
 
     #[test]
