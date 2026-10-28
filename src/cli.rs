@@ -243,11 +243,8 @@ pub fn install(write_rc: bool) -> Result<()> {
         .is_some_and(|p| p == shim);
     if on_path {
         println!("\n`claude` already resolves to the shim. New sessions will hibernate when idle.");
-        return Ok(());
-    }
-    let rc = rc_file();
-    if write_rc {
-        let rc = rc.context("unknown shell; add the PATH line yourself")?;
+    } else if write_rc {
+        let rc = rc_file().context("unknown shell; add the PATH line yourself")?;
         let existing = std::fs::read_to_string(&rc).unwrap_or_default();
         if !existing.contains(&line) {
             std::fs::write(&rc, format!("{existing}\n# claude-hibernate\n{line}\n"))?;
@@ -255,11 +252,67 @@ pub fn install(write_rc: bool) -> Result<()> {
         println!("\nadded to {}. Open a new shell (or `source` it) and start `claude`.", rc.display());
     } else {
         println!("\nPut the shim ahead of the real claude on your PATH:\n\n    {line}\n");
-        if let Some(rc) = rc {
+        if let Some(rc) = rc_file() {
             println!("Or run `claude-hibernate install --write-rc` to append it to {}.", rc.display());
         }
     }
+    report_running();
     Ok(())
+}
+
+/// Sessions started before the shim keep running without it: say so, and
+/// inside herdr show what `migrate` would move.
+fn report_running() {
+    let n = unwrapped_claudes().len();
+    if n == 0 {
+        return;
+    }
+    println!("\n{n} Claude session{} already running without claude-hibernate.", if n == 1 { " is" } else { "s are" });
+    if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
+        println!("They'll hibernate once restarted with `claude` (`claude --resume` picks up where each left off).");
+        return;
+    }
+    println!("`claude-hibernate migrate` restarts them under it in place, keeping each conversation:\n");
+    match crate::migrate::preview() {
+        Ok(0) => println!("\nNone can move right now; run `claude-hibernate migrate` once they're idle."),
+        Ok(_) => println!("\nTo move them: claude-hibernate migrate"),
+        Err(e) => println!("(could not list them: {e:#})"),
+    }
+}
+
+/// Interactive claude processes not under the wrapper. A wrapped claude
+/// carries our hook in its `--settings`, or runs under our PTY leader; a
+/// sleeping wrapper has no claude at all and is known by its status file.
+pub fn unwrapped_claudes() -> Vec<u32> {
+    let Ok(out) = std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid=,tty=,args="]).output() else {
+        return vec![];
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let procs: Vec<(u32, u32, &str, &str)> = text
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (pid, ppid, tty) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?, f.next()?);
+            let args = l.split_once(tty).map_or("", |(_, rest)| rest.trim());
+            Some((pid, ppid, tty, args))
+        })
+        .collect();
+    let wrappers: Vec<u32> = Status::load_all().iter().map(|s| s.pid).collect();
+    let args_of = |pid: u32| procs.iter().find(|p| p.0 == pid).map_or("", |p| p.3);
+    procs
+        .iter()
+        .filter(|&&(pid, ppid, tty, args)| {
+            let argv0 = args.split_whitespace().next().unwrap_or("");
+            argv0.rsplit('/').next() == Some("claude")
+                && !matches!(tty, "?" | "??" | "-") // headless: claude -p from scripts
+                && !args.split_whitespace().any(|a| a == "-p" || a == "--print")
+                && !args.contains("claude-hibernate")
+                && !args_of(ppid).contains("claude-hibernate")
+                && !wrappers.contains(&pid)
+                && !procs.iter().any(|c| c.1 == pid && c.3.contains("__pty-leader"))
+        })
+        .map(|p| p.0)
+        .collect()
 }
 
 fn rc_file() -> Option<PathBuf> {

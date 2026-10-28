@@ -59,11 +59,14 @@ pub struct Config {
     pub exclude_dirs: Vec<String>,
     /// The real claude binary; found on PATH when unset.
     pub real_claude: Option<String>,
+    /// Compact a big sleeping conversation before its prompt cache expires,
+    /// as Claude does to an idle one it still has open.
+    pub compact_while_asleep: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { idle_minutes: 30.0, enabled: true, exclude_dirs: vec![], real_claude: None }
+        Self { idle_minutes: 30.0, enabled: true, exclude_dirs: vec![], real_claude: None, compact_while_asleep: true }
     }
 }
 
@@ -103,6 +106,11 @@ pub struct HookState {
     pub wake_until: f64,
     /// Cron job id -> time after which it can no longer fire.
     pub crons: BTreeMap<String, f64>,
+    /// Claude's last conversation compaction (PreCompact, PostCompact).
+    pub compact_started: f64,
+    pub compact_ended: f64,
+    /// Directories added with /add-dir, which a resume doesn't restore.
+    pub added_dirs: Vec<String>,
 }
 
 impl HookState {
@@ -112,6 +120,14 @@ impl HookState {
 
     pub fn load(path: &Path) -> Self {
         fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+
+    /// Claude is compacting the conversation, or just finished and is
+    /// redrawing it. Seconds after PostCompact that still count.
+    pub fn compacting(&self, now: f64) -> bool {
+        const SETTLE_SECS: f64 = 10.0;
+        self.compact_started > 0.0
+            && (self.compact_ended < self.compact_started || now - self.compact_ended < SETTLE_SECS)
     }
 
     pub fn pending_timers(&self) -> Vec<String> {
@@ -178,10 +194,55 @@ impl Status {
 
 /// Where Claude Code keeps a session's conversation, if it has saved one.
 pub fn transcript_path(session_id: &str) -> Option<PathBuf> {
-    let dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home().join(".claude"));
-    fs::read_dir(dir.join("projects")).ok()?.flatten()
+    fs::read_dir(claude_dir().join("projects")).ok()?.flatten()
         .map(|d| d.path().join(format!("{session_id}.jsonl")))
         .find(|p| p.exists())
+}
+
+/// Claude Code's config directory.
+pub fn claude_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home().join(".claude"))
+}
+
+/// The permission mode a session was last in. Claude records every change
+/// (shift+tab included) but a resume starts in the mode its flags or
+/// settings give, so the wrapper carries it over itself.
+pub fn last_permission_mode(transcript: &Path, session_id: &str) -> Option<String> {
+    use std::io::BufRead;
+    const NEEDLE: &[u8] = b"\"type\":\"permission-mode\"";
+    let mut mode = None;
+    let mut line = vec![];
+    let mut r = std::io::BufReader::new(File::open(transcript).ok()?);
+    while r.read_until(b'\n', &mut line).ok()? > 0 {
+        if line.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line)
+            && v["sessionId"] == session_id
+            && let Some(m) = v["permissionMode"].as_str()
+        {
+            mode = Some(m.to_string());
+        }
+        line.clear();
+    }
+    mode
+}
+
+/// What a running claude process reports about itself in Claude's session
+/// registry (`<claude dir>/sessions/<pid>.json`).
+pub fn claude_registry(pid: u32) -> Option<serde_json::Value> {
+    let s = fs::read_to_string(claude_dir().join(format!("sessions/{pid}.json"))).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+/// A live claude process other than `except` has this session open.
+pub fn session_open_elsewhere(session_id: &str, except: Option<u32>) -> bool {
+    let Ok(entries) = fs::read_dir(claude_dir().join("sessions")) else { return false };
+    entries.flatten().filter_map(|e| fs::read_to_string(e.path()).ok())
+        .filter_map(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .any(|v| {
+            let pid = v["pid"].as_u64().unwrap_or(0) as u32;
+            v["sessionId"] == session_id && pid > 0 && Some(pid) != except
+                && nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+        })
 }
 
 pub fn write_atomic(path: &Path, data: &[u8]) {

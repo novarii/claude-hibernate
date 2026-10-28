@@ -7,6 +7,7 @@
 mod args;
 mod detect;
 mod cli;
+mod compact;
 mod herdr;
 mod hook;
 mod leader;
@@ -57,6 +58,7 @@ fn main() {
         match cmd {
             "run" => shim(tail),
             "__pty-leader" if !tail.is_empty() => Ok(leader::run(&tail[0], &tail[1..])),
+            "__migrate-later" if tail.len() == 1 => Ok(migrate::run_later(&tail[0])),
             "__detect" => {
                 // Debug: classify a screen read from stdin; optional window title arg.
                 let mut screen = String::new();

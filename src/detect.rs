@@ -340,6 +340,18 @@ pub fn prompt_is_empty(body: &str) -> bool {
     text.is_empty() || (text.starts_with("Try \"") && text.ends_with('"') && !text.contains('\n'))
 }
 
+/// The screen down to the prompt box's bottom edge: the conversation and
+/// what is typed, without the footer below it, where a status line can
+/// redraw on a timer (`refreshInterval`) and notices come and go.
+pub fn through_prompt_box(content: &str) -> &str {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(top) = prompt_box_top(&lines) else { return content };
+    match lines[top + 1..].iter().position(|l| is_horizontal_rule(l)) {
+        Some(r) => &content[..line_offset(content, &lines, top + 2 + r)],
+        None => content,
+    }
+}
+
 fn above_prompt_box(content: &str) -> &str {
     let lines: Vec<&str> = content.lines().collect();
     match prompt_box_top(&lines) {
@@ -399,6 +411,13 @@ mod tests {
         assert!(prompt_is_empty("❯ Try \"fix lint errors\"\n"));
         assert!(!prompt_is_empty("❯ fix the redirect\n"));
         assert!(!prompt_is_empty("❯ '\n"));
+    }
+
+    #[test]
+    fn footer_is_not_part_of_the_activity_area() {
+        let screen = "● ok\n────────\n❯ hi\n────────\n  ~/x · 12:01:07";
+        assert_eq!(through_prompt_box(screen), "● ok\n────────\n❯ hi\n────────\n");
+        assert_eq!(through_prompt_box("Do you trust this folder?"), "Do you trust this folder?");
     }
 
     #[test]

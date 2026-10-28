@@ -11,8 +11,13 @@
 //! It never types into a running claude: with the agents panel holding focus
 //! (which the screen does not show), typed text such as `/exit` becomes a new
 //! background agent task, and `/exit` can also stop at a feedback-draft dialog.
+//!
+//! Run from a claude pane (Claude running `migrate` for you), that pane is busy
+//! running it, so it moves last: a detached helper waits for its turn to end
+//! and moves it like the others, by the same checks.
 
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,9 +25,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::args::{resume_args, shell_quote};
+use crate::args::{for_resume, shell_quote};
 use crate::detect;
-use crate::session::has_tool_processes;
+use crate::session::{has_tool_processes, log};
 use crate::state::{HookState, now, transcript_path};
 
 struct Opts {
@@ -189,6 +194,8 @@ struct Plan {
     cwd: String,
     name: Option<String>,
     title: String,
+    /// The permission mode it is in now, which a resume would not restore.
+    mode: Option<String>,
 }
 
 enum Verdict {
@@ -197,13 +204,16 @@ enum Verdict {
     Quiet, // not a claude agent; not worth a line
 }
 
-fn check(agent: &Value) -> Verdict {
+/// Whether the agent can be moved now. `later` is for the pane running
+/// `migrate`, busy until its turn ends: only what that won't change is
+/// checked, and the helper that moves it runs every check first.
+fn check(agent: &Value, later: bool) -> Verdict {
     let pane = agent["pane_id"].as_str().unwrap_or("").to_string();
     if agent["agent"].as_str() != Some("claude") {
         return Verdict::Quiet;
     }
     let status = agent["agent_status"].as_str().unwrap_or("");
-    if !matches!(status, "idle" | "done") {
+    if !later && !matches!(status, "idle" | "done") {
         return Verdict::Skip(status.to_string());
     }
     let Some(session_id) = agent["agent_session"]["value"].as_str().map(str::to_string) else {
@@ -225,24 +235,26 @@ fn check(agent: &Value) -> Verdict {
     if info["shell_pid"].as_u64().is_none() || ppid(pid) != info["shell_pid"].as_u64() {
         return Verdict::Skip("claude is not running directly under the pane's shell".into());
     }
-    let screen = pane_text(&pane);
-    let title = agent["terminal_title"].as_str().unwrap_or("");
-    if screen.contains("enter to return") {
-        return Verdict::Skip("the agents panel has keyboard focus".into());
-    }
-    let state = detect::claude().detect(&screen, title).state;
-    if state != detect::State::Idle {
-        return Verdict::Skip(format!("claude looks {state:?}").to_lowercase());
-    }
-    match detect::prompt_box_body(&screen) {
-        None => return Verdict::Skip("no prompt box on screen".into()),
-        Some(body) if !detect::prompt_is_empty(body) => {
-            return Verdict::Skip("unsent text in the prompt".into());
+    if !later {
+        let screen = pane_text(&pane);
+        let title = agent["terminal_title"].as_str().unwrap_or("");
+        if screen.contains("enter to return") {
+            return Verdict::Skip("the agents panel has keyboard focus".into());
         }
-        _ => {}
-    }
-    if has_tool_processes(nix::unistd::Pid::from_raw(pid as i32)) {
-        return Verdict::Skip("background shell running".into());
+        let state = detect::claude().detect(&screen, title).state;
+        if state != detect::State::Idle {
+            return Verdict::Skip(format!("claude looks {state:?}").to_lowercase());
+        }
+        match detect::prompt_box_body(&screen) {
+            None => return Verdict::Skip("no prompt box on screen".into()),
+            Some(body) if !detect::prompt_is_empty(body) => {
+                return Verdict::Skip("unsent text in the prompt".into());
+            }
+            _ => {}
+        }
+        if has_tool_processes(nix::unistd::Pid::from_raw(pid as i32)) {
+            return Verdict::Skip("background shell running".into());
+        }
     }
     let Some(path) = transcript_path(&session_id) else {
         return Verdict::Skip("no saved conversation yet".into());
@@ -251,12 +263,16 @@ fn check(agent: &Value) -> Verdict {
     if !timers.is_empty() {
         return Verdict::Skip(timers.join(", "));
     }
+    if crate::state::claude_registry(pid as u32).is_some_and(|r| r["bridgeSessionId"].is_string()) {
+        return Verdict::Skip("Remote Control is on".into());
+    }
     let argv = proc_["argv"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
     let cwd = proc_["cwd"].as_str().map(str::to_string)
         .or_else(|| std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.to_string_lossy().into_owned()));
     let Some(cwd) = cwd else { return Verdict::Skip("working directory unknown".into()) };
+    let mode = crate::state::last_permission_mode(&path, &session_id);
     Verdict::Move(Plan {
-        pane, session_id, pid, argv, cwd,
+        pane, session_id, pid, argv, cwd, mode,
         name: agent["name"].as_str().map(str::to_string),
         title: agent["terminal_title_stripped"].as_str().unwrap_or("").to_string(),
     })
@@ -290,7 +306,7 @@ fn shim() -> Result<PathBuf> {
 }
 
 fn relaunch_command(p: &Plan, shim: &std::path::Path) -> String {
-    let flags: Vec<String> = resume_args(p.argv.get(1..).unwrap_or(&[])).iter().map(|f| shell_quote(f)).collect();
+    let flags: Vec<String> = for_resume(p.argv.get(1..).unwrap_or(&[]), p.mode.as_deref(), &[]).iter().map(|f| shell_quote(f)).collect();
     let mut cmd = format!("cd {} && {}", shell_quote(&p.cwd), shell_quote(&shim.to_string_lossy()));
     for f in flags {
         cmd.push(' ');
@@ -337,29 +353,82 @@ fn migrate_one(p: &Plan, shim: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// How long the helper waits for the pane that ran `migrate` to go idle.
+const LATER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Idle for this long, checked twice, before it moves: not a pause between
+/// two steps of the turn.
+const LATER_SETTLE: Duration = Duration::from_secs(4);
+
+/// Move the pane running `migrate` once its turn ends, from a process of
+/// its own session so it outlives that pane's claude.
+fn move_later(pane: &str) -> Result<()> {
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(["__migrate-later", pane])
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::unistd::setsid()?;
+            Ok(())
+        });
+    }
+    cmd.spawn().context("starting the helper")?;
+    Ok(())
+}
+
+/// The helper: wait for the pane to pass every check, then move it. Gives
+/// up quietly if it doesn't within LATER_TIMEOUT.
+pub fn run_later(pane: &str) -> i32 {
+    let Ok(shim) = shim() else { return 1 };
+    let start = Instant::now();
+    let mut ready_since: Option<Instant> = None;
+    while start.elapsed() < LATER_TIMEOUT {
+        std::thread::sleep(Duration::from_secs(2));
+        let Ok(agent) = herdr_json(&["agent", "get", pane]) else { return 1 }; // pane closed
+        match check(&agent["agent"], false) {
+            Verdict::Move(p) => match ready_since {
+                None => ready_since = Some(Instant::now()),
+                Some(t) if t.elapsed() >= LATER_SETTLE => {
+                    let result = migrate_one(&p, &shim);
+                    log(&format!("migrate {pane} after its turn: {result:?}"));
+                    return if result.is_ok() { 0 } else { 1 };
+                }
+                Some(_) => {}
+            },
+            Verdict::Skip(why) if why == "already hibernating" => return 0,
+            Verdict::Skip(_) => ready_since = None,
+            Verdict::Quiet => return 0, // claude was quit
+        }
+    }
+    log(&format!("migrate {pane}: still busy after {}s, left as is", LATER_TIMEOUT.as_secs()));
+    0
+}
+
 // ---------------------------------------------------------------- entry
 
-pub fn run(args: &[String]) -> Result<i32> {
-    let o = parse(args)?;
-    let shim = match shim() {
-        Ok(shim) => Some(shim),
-        Err(e) if o.dry_run => {
-            println!("note: {e:#}\n");
-            None
-        }
-        Err(e) => return Err(e),
-    };
+/// List every claude agent with what would happen to it, and return the
+/// ones to move now, the pane running this to move after its turn, and
+/// how many were skipped.
+fn survey(o: &Opts) -> Result<(Vec<Plan>, Option<Plan>, usize)> {
     let me = std::env::var("HERDR_PANE_ID").ok();
     let agents = herdr_json(&["agent", "list"])?["agents"].as_array().cloned().unwrap_or_default();
     let mut plans = vec![];
+    let mut later: Option<Plan> = None;
     let mut skipped = 0;
     for a in &agents {
         let pane = a["pane_id"].as_str().unwrap_or("");
-        if me.as_deref() == Some(pane) || o.exclude.iter().any(|x| x == pane) || (!o.only.is_empty() && !o.only.iter().any(|x| x == pane)) {
+        if o.exclude.iter().any(|x| x == pane) || (!o.only.is_empty() && !o.only.iter().any(|x| x == pane)) {
             continue;
         }
+        let own = me.as_deref() == Some(pane);
         let title: String = a["terminal_title_stripped"].as_str().unwrap_or("").chars().take(44).collect();
-        match check(a) {
+        match check(a, own) {
+            Verdict::Move(p) if own => {
+                println!("{:7} {pane:9} {title:44} after this turn", if o.dry_run || o.confirm { "would" } else { "later" });
+                later = Some(p);
+            }
             Verdict::Move(p) => {
                 println!("{:7} {pane:9} {title:44}", if o.dry_run || o.confirm { "would" } else { "move" });
                 plans.push(p);
@@ -371,12 +440,36 @@ pub fn run(args: &[String]) -> Result<i32> {
             Verdict::Quiet => {}
         }
     }
-    println!("\n{} to move, {skipped} skipped{}", plans.len(), if me.is_some() { " (this pane is never moved)" } else { "" });
-    if o.dry_run || plans.is_empty() {
+    let total = plans.len() + usize::from(later.is_some());
+    println!("\n{total} to move, {skipped} skipped{}", if later.is_some() { " (this pane after this turn)" } else { "" });
+    println!("Agents that are working, waiting on you, or holding unsent text are skipped, so nothing is interrupted.");
+    Ok((plans, later, skipped))
+}
+
+/// What `migrate` would do, as `--dry-run` shows it; how many it would move.
+pub fn preview() -> Result<usize> {
+    let o = parse(&["--dry-run".into()])?;
+    let (plans, later, _) = survey(&o)?;
+    Ok(plans.len() + usize::from(later.is_some()))
+}
+
+pub fn run(args: &[String]) -> Result<i32> {
+    let o = parse(args)?;
+    let shim = match shim() {
+        Ok(shim) => Some(shim),
+        Err(e) if o.dry_run => {
+            println!("note: {e:#}\n");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    let (plans, later, skipped) = survey(&o)?;
+    let total = plans.len() + usize::from(later.is_some());
+    if o.dry_run || total == 0 {
         return Ok(0);
     }
     if o.confirm {
-        print!("Move {} agents under claude-hibernate? Each one exits and resumes in place. [y/N] ", plans.len());
+        print!("Move {total} agents under claude-hibernate? Each one exits and resumes in place. [y/N] ");
         std::io::stdout().flush()?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
@@ -400,7 +493,18 @@ pub fn run(args: &[String]) -> Result<i32> {
             }
         }
     }
-    println!("\nmoved {moved}, failed {failed}, skipped {skipped}");
+    if !plans.is_empty() {
+        println!("\nmoved {moved}, failed {failed}, skipped {skipped}");
+    }
+    if let (Some(p), Some(_)) = (&later, &shim) {
+        match move_later(&p.pane) {
+            Ok(()) => println!("this pane moves once this turn ends (it resumes the same conversation)"),
+            Err(e) => {
+                failed += 1;
+                println!("FAIL    {:9} {e:#}", p.pane);
+            }
+        }
+    }
     Ok(if failed > 0 { 1 } else { 0 })
 }
 
@@ -419,12 +523,13 @@ mod tests {
         let p = Plan {
             pane: "w1:p1".into(), session_id: "abc".into(), pid: 1, name: None, title: String::new(),
             argv: vec!["claude".into(), "--model".into(), "opus".into(), "--resume".into(), "old".into()],
-            cwd: "/tmp/my dir".into(),
+            cwd: "/tmp/my dir".into(), mode: Some("plan".into()),
         };
         let shim = std::path::Path::new("/home/me/.local/share/claude-hibernate/bin/claude");
         assert_eq!(relaunch_command(&p, shim),
-            "cd '/tmp/my dir' && /home/me/.local/share/claude-hibernate/bin/claude --model opus --resume abc");
+            "cd '/tmp/my dir' && /home/me/.local/share/claude-hibernate/bin/claude --model opus --permission-mode plan --resume abc");
     }
+
 
     #[test]
     fn options() {

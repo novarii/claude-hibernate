@@ -1,8 +1,11 @@
 //! `claude-hibernate hook <state-file>`: run by Claude Code hooks that the
 //! wrapper injects with `--settings`. Records the session id, when a prompt
-//! was last submitted (for draft detection), and the timers
-//! that only live inside the claude process (/loop wake-ups, cron jobs), so the
-//! wrapper never kills a session that still has work scheduled.
+//! was last submitted (for draft detection), when Claude last compacted the
+//! conversation (so housekeeping doesn't count as use), directories added
+//! with /add-dir (to restore on resume), and the timers that only live inside
+//! the claude process (/loop wake-ups, cron jobs), so the wrapper never kills
+//! a session that still has work scheduled. Running background agents show
+//! on screen, where herdr's detection rules see them.
 
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -23,7 +26,11 @@ pub fn settings_json(exe: &str, state_path: &Path) -> String {
     let cmd = format!("{} hook {}", shell_quote(exe), shell_quote(&state_path.to_string_lossy()));
     let hook = serde_json::json!([{ "hooks": [{ "type": "command", "command": cmd }] }]);
     let tools = serde_json::json!([{ "matcher": TIMER_TOOLS, "hooks": [{ "type": "command", "command": cmd }] }]);
-    serde_json::json!({ "hooks": { "SessionStart": hook, "UserPromptSubmit": hook, "PostToolUse": tools } }).to_string()
+    serde_json::json!({ "hooks": {
+        "SessionStart": hook, "UserPromptSubmit": hook, "PostToolUse": tools,
+        "PreCompact": hook, "PostCompact": hook,
+        "DirectoryAdded": hook,
+    } }).to_string()
 }
 
 pub fn run(state_path: &Path) -> anyhow::Result<()> {
@@ -52,7 +59,16 @@ pub(crate) fn apply(state: &mut HookState, event: &Value, now: f64) {
             }
             state.session_starts += 1;
         }
+        "DirectoryAdded" => {
+            if let Some(dir) = event["directory"].as_str()
+                && !state.added_dirs.iter().any(|d| d == dir)
+            {
+                state.added_dirs.push(dir.to_string());
+            }
+        }
         "UserPromptSubmit" => state.last_submit = now,
+        "PreCompact" => state.compact_started = now,
+        "PostCompact" => state.compact_ended = now,
         "PostToolUse" => {
             let input = &event["tool_input"];
             let response = &event["tool_response"];
@@ -124,6 +140,16 @@ mod tests {
         apply(&mut s, &json!({"hook_event_name": "PostToolUse", "tool_name": "ScheduleWakeup",
             "tool_input": {"stop": true}}), 1100.0);
         assert_eq!(s.wake_until, 0.0);
+    }
+
+    #[test]
+    fn compaction_window() {
+        let mut s = HookState::default();
+        apply(&mut s, &json!({"hook_event_name": "PreCompact", "trigger": "idle"}), 100.0);
+        assert!(s.compacting(110.0));
+        apply(&mut s, &json!({"hook_event_name": "PostCompact", "trigger": "idle"}), 130.0);
+        assert!(s.compacting(135.0)); // still drawing the compacted view
+        assert!(!s.compacting(150.0));
     }
 
     #[test]

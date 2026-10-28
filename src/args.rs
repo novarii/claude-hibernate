@@ -8,7 +8,9 @@ const SUBCOMMANDS: &[&str] = &[
     "plugin", "plugins", "purge", "respawn", "rm", "setup-token", "stop", "kill", "ultrareview",
     "update", "upgrade",
 ];
-const NON_INTERACTIVE: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version"];
+/// Not a local session to resume: print mode, help, and `--cloud`, which
+/// runs the session in the cloud and only attaches to it here.
+const NON_INTERACTIVE: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version", "--cloud"];
 /// Options that take one value (`<x>` or `[x]` in `claude --help`). Like
 /// commander, a following token that does not start with `-` is the value.
 const VALUE_FLAGS: &[&str] = &[
@@ -44,7 +46,7 @@ pub fn shell_quote(s: &str) -> String {
 pub fn wants_wrapping(args: &[String]) -> bool {
     let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
     tty && !args.first().is_some_and(|a| SUBCOMMANDS.contains(&a.as_str()))
-        && !args.iter().any(|a| NON_INTERACTIVE.contains(&a.as_str()))
+        && !args.iter().any(|a| NON_INTERACTIVE.contains(&a.split_once('=').map_or(a.as_str(), |(n, _)| n)))
 }
 
 /// A user-supplied --settings would compete with the one we inject.
@@ -86,6 +88,37 @@ pub fn resume_args(args: &[String]) -> Vec<String> {
         if !SESSION_FLAGS.contains(&name) {
             out.extend(group);
         }
+    }
+    out
+}
+
+/// `resume_args` plus what the session changed since it started that a
+/// resume doesn't restore: its permission mode (shift+tab) and /add-dir
+/// directories.
+///
+/// `--dangerously-skip-permissions` beats `--permission-mode`, so it becomes
+/// `--allow-dangerously-skip-permissions`: bypass stays one shift+tab away
+/// but a session left in plan mode wakes in plan mode.
+pub fn for_resume(args: &[String], mode: Option<&str>, added_dirs: &[String]) -> Vec<String> {
+    let mut out = vec![];
+    let mut it = resume_args(args).into_iter().peekable();
+    while let Some(a) = it.next() {
+        if mode.is_some() && a == "--permission-mode" {
+            it.next_if(|v| !v.starts_with('-'));
+        } else if mode.is_some() && a.starts_with("--permission-mode=") {
+            // replaced below
+        } else if mode.is_some() && a == "--dangerously-skip-permissions" {
+            out.push("--allow-dangerously-skip-permissions".to_string());
+        } else {
+            out.push(a);
+        }
+    }
+    if let Some(m) = mode {
+        out.extend(["--permission-mode".to_string(), m.to_string()]);
+    }
+    if !added_dirs.is_empty() {
+        out.push("--add-dir".to_string());
+        out.extend(added_dirs.iter().cloned());
     }
     out
 }
@@ -134,5 +167,16 @@ mod tests {
             v(&["--add-dir", "a", "b", "--permission-mode", "plan"])
         );
         assert_eq!(resume_args(&v(&["--verbose", "--", "-starts with dash"])), v(&["--verbose"]));
+    }
+
+    #[test]
+    fn resume_restores_mode_and_dirs() {
+        assert_eq!(
+            for_resume(&v(&["--dangerously-skip-permissions", "--permission-mode", "auto", "-r", "x"]), Some("plan"), &v(&["/a"])),
+            v(&["--allow-dangerously-skip-permissions", "--permission-mode", "plan", "--add-dir", "/a"])
+        );
+        assert_eq!(for_resume(&v(&["--permission-mode=auto", "--model", "opus"]), Some("default"), &[]),
+            v(&["--model", "opus", "--permission-mode", "default"]));
+        assert_eq!(for_resume(&v(&["--dangerously-skip-permissions"]), None, &[]), v(&["--dangerously-skip-permissions"]));
     }
 }

@@ -29,7 +29,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::state::{Config, HookState, Status, now};
-use crate::{args, detect, herdr, hook};
+use crate::{args, compact, detect, herdr, hook};
 
 nix::ioctl_read_bad!(get_winsize, libc::TIOCGWINSZ, Winsize);
 nix::ioctl_write_ptr_bad!(set_winsize, libc::TIOCSWINSZ, Winsize);
@@ -44,6 +44,8 @@ const READY_QUIET: Duration = Duration::from_millis(300);
 const REVEAL_AFTER: Duration = Duration::from_secs(8);
 /// Give up on replaying held input if claude isn't ready by then.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Screen changes closer together than this are one burst of activity.
+const BURST_GAP: Duration = Duration::from_secs(5);
 const KILL_GRACE: Duration = Duration::from_secs(15);
 /// Turn off the terminal modes claude may have left on: kitty keyboard,
 /// bracketed paste, mouse and focus reporting, alternate screen; show the cursor.
@@ -162,6 +164,12 @@ pub struct Session {
     waking: Option<Waking>,
     asleep: bool,
     last_activity: Instant,
+    /// `last_activity` before the latest burst of screen changes, and when
+    /// the screen last changed.
+    prev_activity: Instant,
+    last_change: Instant,
+    /// The compaction (its PreCompact time) already accounted for.
+    compact_seen: f64,
     last_output: Instant,
     screen_hash: u64,
     /// When the user last typed; compared with the last submitted prompt to
@@ -169,6 +177,13 @@ pub struct Session {
     last_input_at: f64,
     status: Status,
     cfg: Config,
+    /// While asleep: when to compact the conversation, the compaction
+    /// running now (with its lock), and when it finished.
+    compact_plan: Option<compact::Plan>,
+    compactor: Option<(std::process::Child, std::fs::File)>,
+    compacted_at: Option<f64>,
+    /// The permission mode to wake in, read when it went to sleep.
+    resume_mode: Option<String>,
 }
 
 fn stdin() -> BorrowedFd<'static> {
@@ -247,6 +262,9 @@ impl Session {
             waking: None,
             asleep: false,
             last_activity: Instant::now(),
+            prev_activity: Instant::now(),
+            last_change: Instant::now(),
+            compact_seen: 0.0,
             last_output: Instant::now(),
             screen_hash: 0,
             last_input_at: 0.0,
@@ -259,6 +277,10 @@ impl Session {
             },
             cwd,
             cfg: Config::load(),
+            compact_plan: None,
+            compactor: None,
+            compacted_at: None,
+            resume_mode: None,
         })
     }
 
@@ -479,6 +501,13 @@ impl Session {
         self.asleep = true;
         self.status.asleep = true;
         self.status.since = now();
+        self.compacted_at = None;
+        let id = self.status.session_id.clone().unwrap_or_default();
+        self.resume_mode = crate::state::transcript_path(&id).and_then(|t| crate::state::last_permission_mode(&t, &id));
+        self.compact_plan = compact::plan(&id, &self.cwd);
+        if let Some(p) = &self.compact_plan {
+            log(&format!("will compact {} tokens in {:.0}s", p.tokens, p.at - now()));
+        }
         self.draw_sleep_screen();
         herdr::mark_asleep();
         self.status.save();
@@ -505,6 +534,7 @@ impl Session {
     }
 
     fn shutdown(&mut self, sig: Signal) -> i32 {
+        self.stop_compacting();
         let Some(pid) = self.child.as_ref().map(|c| c.pid) else { return 128 + sig as i32 };
         self.reveal();
         let _ = kill(pid, sig);
@@ -600,7 +630,11 @@ impl Session {
                 }
                 return;
             }
-        if self.asleep || self.child.is_none() {
+        if self.asleep {
+            self.tick_asleep();
+            return;
+        }
+        if self.child.is_none() {
             return;
         }
         if let Some(c) = &mut self.child
@@ -610,15 +644,36 @@ impl Session {
             self.status.child_pid = c.claude.map(|p| p.as_raw() as u32);
         }
 
+        // Claude compacting the conversation on its own, as it does to an
+        // idle session before the prompt cache expires, is housekeeping, not
+        // use: its screen changes don't restart the idle clock. Undo a bump
+        // from its first frames if they were drawn before the hook ran.
+        let hooks = self.hooks();
+        let compacting = hooks.compacting(now());
+        if hooks.compact_started > self.compact_seen {
+            self.compact_seen = hooks.compact_started;
+            let started = Instant::now() - Duration::from_secs_f64((now() - hooks.compact_started).max(0.0));
+            if self.last_input_at < hooks.compact_started && self.last_activity + BURST_GAP > started {
+                self.last_activity = self.prev_activity.min(self.last_activity);
+            }
+        }
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.parser.screen().contents().hash(&mut h);
+        // The footer under the prompt box (status line, notices) redraws on
+        // its own; only the conversation and the prompt count as activity.
+        detect::through_prompt_box(&self.parser.screen().contents()).hash(&mut h);
         let hash = h.finish();
         if hash != self.screen_hash {
             self.screen_hash = hash;
-            self.last_activity = self.last_activity.max(self.last_output);
+            if !compacting {
+                if self.last_change.elapsed() >= BURST_GAP {
+                    self.prev_activity = self.last_activity;
+                }
+                self.last_activity = self.last_activity.max(self.last_output);
+            }
+            self.last_change = Instant::now();
             self.status.held_by = None; // re-evaluated once idle again
         }
-        if let Some(id) = self.hooks().session_id {
+        if let Some(id) = hooks.session_id {
             self.status.session_id = Some(id);
         }
         self.status.title = self.title();
@@ -655,6 +710,14 @@ impl Session {
         if !timers.is_empty() {
             return Some(timers.join(", "));
         }
+        // Remote Control reaches the session through this process, from
+        // claude.ai or the phone; asleep, it would show as offline.
+        let claude = self.child.as_ref().and_then(|c| c.claude);
+        if claude.and_then(|p| crate::state::claude_registry(p.as_raw() as u32))
+            .is_some_and(|r| r["bridgeSessionId"].is_string())
+        {
+            return Some("Remote Control is on".into());
+        }
         let d = self.detect();
         if d.state != detect::State::Idle {
             let state = format!("{:?}", d.state).to_lowercase();
@@ -677,6 +740,74 @@ impl Session {
             return Some("background shell".into());
         }
         None
+    }
+
+    /// While asleep, compact the conversation when Claude would have, had it
+    /// stayed open: one headless `/compact` before the prompt cache expires.
+    fn tick_asleep(&mut self) {
+        if let Some((child, _)) = &mut self.compactor {
+            let Ok(Some(exit)) = child.try_wait() else { return };
+            log(&format!("compaction finished: {exit}"));
+            self.compactor = None; // releases the lock
+            self.status.held_by = None;
+            if exit.success() {
+                self.compacted_at = Some(now());
+                self.draw_sleep_screen();
+            }
+            self.status.save();
+            return;
+        }
+        let Some(plan) = &self.compact_plan else { return };
+        let t = now();
+        if t < plan.at {
+            return;
+        }
+        self.cfg = Config::load();
+        if t > plan.deadline || !self.cfg.compact_while_asleep {
+            self.compact_plan = None;
+            return;
+        }
+        let Some(id) = self.status.session_id.clone() else { return };
+        // Opened in another terminal meanwhile: it is that claude's to
+        // compact. Or it was used there and closed: plan again.
+        if crate::state::session_open_elsewhere(&id, None) {
+            log("not compacting: the session is open elsewhere");
+            self.compact_plan = None;
+            return;
+        }
+        let cwd = match compact::plan(&id, &self.cwd) {
+            Some(fresh) if fresh.at <= t => fresh.cwd,
+            fresh => {
+                self.compact_plan = fresh;
+                return;
+            }
+        };
+        // Another session may hold the lock; try again next tick.
+        if let Some(running) = compact::start(&self.real, &args::resume_args(&self.args), &id, &cwd) {
+            log("compacting");
+            self.compactor = Some(running);
+            self.compact_plan = None;
+            self.status.held_by = Some("compacting".into());
+            self.status.save();
+        }
+    }
+
+    /// Waking or exiting: a compaction still running is abandoned. Claude
+    /// writes the compacted conversation only once it has the summary.
+    fn stop_compacting(&mut self) {
+        let Some((mut child, _lock)) = self.compactor.take() else { return };
+        let pid = Pid::from_raw(child.id() as i32);
+        let _ = kill(pid, Signal::SIGTERM);
+        for _ in 0..40 {
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        log("compaction stopped");
+        self.status.held_by = None;
     }
 
     fn try_hibernate(&mut self, forced: bool) {
@@ -752,6 +883,7 @@ impl Session {
             String::new(),
             format!("  session {}", self.status.session_id.as_deref().unwrap_or("?")),
             format!("  asleep since {since}{freed}"),
+            self.compacted_at.map(|t| format!("  compacted at {}, before the prompt cache expired", chrono_like(t))).unwrap_or_default(),
             String::new(),
             "  press any key to resume".to_string(),
         ] {
@@ -785,13 +917,17 @@ impl Session {
     fn wake(&mut self, held_input: Vec<u8>) {
         let Some(id) = self.status.session_id.clone() else { return };
         log(&format!("wake input {:?}", String::from_utf8_lossy(&held_input)));
+        self.stop_compacting();
+        self.compact_plan = None;
         self.asleep = false;
         self.status.asleep = false;
         self.status.freed_kb = 0;
-        let starts_before = self.hooks().session_starts;
-        let mut argv = args::resume_args(&self.args);
+        let hooks = self.hooks();
+        let starts_before = hooks.session_starts;
+        let mut argv = args::for_resume(&self.args, self.resume_mode.as_deref(), &hooks.added_dirs);
         argv.push("--resume".into());
         argv.push(id);
+        log(&format!("resume with {argv:?}"));
         self.waking = Some(Waking { since: Instant::now(), starts_before, held_input, output: vec![], revealed: false });
         self.draw_waking_screen();
         if let Err(e) = self.spawn(&argv) {
@@ -849,7 +985,7 @@ fn typed_preview(data: &[u8]) -> String {
     out.trim_end().to_string()
 }
 
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     if let Some(path) = std::env::var_os("CLAUDE_HIBERNATE_LOG") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
