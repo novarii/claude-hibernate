@@ -54,17 +54,48 @@ const RESET_MODES: &str = "\x1b[<u\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x
 /// Input the terminal generates on its own: focus in and out. It must not
 /// count as a keystroke (or the session wakes when its pane is focused).
 fn without_terminal_reports(data: &[u8]) -> Vec<u8> {
+    // Replies the terminal sends on its own are not keypresses: focus in/out,
+    // light/dark reports (CSI ? 997 ; n n), other CSI ? / CSI > replies
+    // (DSR, DA, DECRQM, kitty keyboard flags), and OSC/DCS/APC strings
+    // (color queries, XTVERSION). A theme change must not wake every session.
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
-        if data[i..].starts_with(b"\x1b[I") || data[i..].starts_with(b"\x1b[O") {
+        let rest = &data[i..];
+        if rest.starts_with(b"\x1b[I") || rest.starts_with(b"\x1b[O") {
             i += 3;
+        } else if rest.len() > 2 && rest[0] == 0x1b && rest[1] == b'[' && (rest[2] == b'?' || rest[2] == b'>') {
+            let end = rest[3..].iter().position(|b| (0x40..=0x7e).contains(b));
+            i += end.map_or(rest.len(), |e| 3 + e + 1);
+        } else if rest.len() > 1 && rest[0] == 0x1b && matches!(rest[1], b']' | b'P' | b'_') {
+            let mut j = 2;
+            while j < rest.len() && rest[j] != 0x07 && !rest[j..].starts_with(b"\x1b\\") {
+                j += 1;
+            }
+            i += if j >= rest.len() { j } else if rest[j] == 0x07 { j + 1 } else { j + 2 };
         } else {
             out.push(data[i]);
             i += 1;
         }
     }
     out
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::without_terminal_reports as f;
+    #[test]
+    fn drops_reports_keeps_keys() {
+        assert!(f(b"\x1b[?997;1n").is_empty());
+        assert!(f(b"\x1b[?997;2n\x1b[I").is_empty());
+        assert!(f(b"\x1b]11;rgb:fdfd/f6f6/e3e3\x1b\\").is_empty());
+        assert!(f(b"\x1b]10;rgb:5858/6e6e/7575\x07").is_empty());
+        assert!(f(b"\x1b[?1;2c\x1b[>1;10;0c").is_empty());
+        assert_eq!(f(b"\x1b[?997;1na"), b"a");
+        assert_eq!(f(b"\x1b[A"), b"\x1b[A");
+        assert_eq!(f(b"\r"), b"\r");
+        assert_eq!(f(b"\x1b"), b"\x1b");
+    }
 }
 
 /// Keeps the window title claude sets (OSC 0/2); vt100 reports it by callback.
