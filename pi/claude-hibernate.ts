@@ -4,10 +4,14 @@
 //
 // The wrapper loads it with `-e` and names the state file in
 // CLAUDE_HIBERNATE_PI_STATE. Without that variable it does nothing, so it is
-// harmless when loaded any other way.
+// harmless when loaded any other way. On a resume CLAUDE_HIBERNATE_DRAFT_IN
+// names a file with the draft the editor held when pi went to sleep, which
+// it puts back.
 import * as fs from "node:fs";
 
 const STATE = process.env.CLAUDE_HIBERNATE_PI_STATE;
+const DRAFT_IN = process.env.CLAUDE_HIBERNATE_DRAFT_IN;
+delete process.env.CLAUDE_HIBERNATE_DRAFT_IN; // not for pi's own children
 
 interface State {
   pid: number;
@@ -23,8 +27,12 @@ interface State {
   pending: boolean;
   /** Extension dialogs waiting on the user. */
   dialogs: number;
-  /** Text sitting unsent in the editor. */
+  /** Text sitting unsent in the editor, and when the editor was last read. */
   draft: boolean;
+  draft_text: string;
+  polled_at: number;
+  /** When the draft was put back after a resume; -1 when that failed. */
+  draft_restored: number;
   compacting: boolean;
   /** Last prompt the user submitted, and last agent activity (epoch seconds). */
   last_submit: number;
@@ -39,7 +47,8 @@ interface State {
 const g = globalThis as any;
 const state: State = (g.__claudeHibernatePi ??= {
   pid: process.pid, starts: 0, busy: false, pending: false, dialogs: 0,
-  draft: false, compacting: false, last_submit: 0, last_event: 0, first_work: 0,
+  draft: false, draft_text: "", polled_at: 0, draft_restored: 0,
+  compacting: false, last_submit: 0, last_event: 0, first_work: 0,
 });
 
 const now = () => Date.now() / 1000;
@@ -97,11 +106,19 @@ export default function (pi: any) {
   let timer: ReturnType<typeof setInterval> | undefined;
 
   // Things only visible by asking: the editor, the queue, idleness.
+  // Written when the editor changes, and every few seconds, so the wrapper
+  // can tell the report is newer than the last key it passed through.
+  const readEditor = (ctx: any) => {
+    const text: string = ctx.hasUI ? ctx.ui.getEditorText() : "";
+    if (text !== state.draft_text || now() - state.polled_at >= 5) state.polled_at = now();
+    state.draft_text = text;
+    state.draft = text.trim().length > 0;
+  };
   const poll = () => {
     const ctx = ctxNow;
     if (!ctx) return;
     try {
-      state.draft = ctx.hasUI ? ctx.ui.getEditorText().trim().length > 0 : false;
+      readEditor(ctx);
       state.pending = ctx.hasPendingMessages();
       if (ctx.isIdle() === false) state.busy = true;
     } catch {
@@ -122,8 +139,28 @@ export default function (pi: any) {
     if (timer) clearInterval(timer);
     timer = setInterval(poll, 1000);
     timer.unref?.();
+    if (DRAFT_IN && state.draft_restored === 0 && ctx.hasUI) {
+      try {
+        const text = JSON.parse(fs.readFileSync(DRAFT_IN, "utf8")).text ?? "";
+        if (text) ctx.ui.setEditorText(text);
+        state.draft_restored = now();
+      } catch {
+        state.draft_restored = -1;
+      }
+      try {
+        fs.unlinkSync(DRAFT_IN);
+      } catch {}
+      poll();
+    }
   });
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_e: any, ctx: any) => {
+    // The editor as it stands at exit: what the sleep screen shows and the
+    // resume puts back.
+    try {
+      readEditor(ctx);
+      state.polled_at = now();
+      write();
+    } catch {}
     ctxNow = undefined;
     if (timer) clearInterval(timer);
     timer = undefined;

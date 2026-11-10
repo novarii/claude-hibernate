@@ -1,0 +1,1 @@
+{ "name": "hibernate-draft", "version": "0.1.0", "description": "Keeps the prompt draft of a hibernating session: reports it to the claude-hibernate wrapper and puts it back on resume" }

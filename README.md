@@ -59,7 +59,7 @@ that session moves too, once its turn ends.
 A session only sleeps when nothing can be lost. It stays awake while:
 
 - you've used it in the last 30 minutes
-- there's a draft in the prompt, or a dialog or permission prompt is open
+- a dialog or permission prompt is open, or you're mid-keystroke
 - Claude is working, or a background shell, Monitor, or subagent is running
 - a `/loop` or scheduled cron job is pending
 - Remote Control is on, so the session stays reachable from claude.ai and your phone
@@ -101,7 +101,24 @@ claude-hibernate uninstall
 idle_minutes = 30
 exclude_dirs = ["~/work/always-on"]
 compact_while_asleep = true   # see below
+sleep_with_draft = true       # false: unsent text keeps a session awake
 ```
+
+### Unsent drafts
+
+A session with text typed in the prompt still goes to sleep. The draft is
+shown on the sleep screen and is back in the prompt when it wakes, unsent,
+line breaks and all; whatever you type to wake it lands after it.
+
+For Claude, the wrapper loads a small Claude Code mod for that process only
+(`--plugin-dir`, nothing installed). The mod reads the prompt box with
+`$.prompt.read()` and puts it back after `--resume` with `$.prompt.fill()`,
+which is exact where replaying keystrokes or reading the screen is not.
+A prompt holding an image or a long paste Claude shows collapsed
+(`[Pasted text #1 +29 lines]`) still keeps the session awake, since the
+mod can read only the placeholder. Where the mod doesn't load (an older
+Claude Code, mods turned off), a draft keeps the session awake as before.
+pi's extension does the same with pi's editor.
 
 ### Compacting while asleep
 
@@ -144,7 +161,6 @@ awake while:
 
 - a prompt is running (`agent_start` until `agent_settled`), or compacting
 - messages are queued, or an extension dialog is open
-- there's unsent text in the editor
 - a `!` command, a bash tool call or a background job is still running
 
 Waking runs `pi --session <file>` with your original flags, minus the session

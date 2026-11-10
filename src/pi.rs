@@ -110,6 +110,9 @@ pub struct PiState {
     pub pending: bool,
     pub dialogs: u32,
     pub draft: bool,
+    pub draft_text: String,
+    pub polled_at: f64,
+    pub draft_restored: f64,
     pub compacting: bool,
     pub last_submit: f64,
     pub last_event: f64,
@@ -126,8 +129,9 @@ impl PiState {
         fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
     }
 
-    /// Why pi must stay awake, judged from its own report.
-    pub fn held_by(&self) -> Option<String> {
+    /// Why pi must stay awake, judged from its own report. A draft holds it
+    /// unless `draft_ok` (it sleeps and comes back with the draft).
+    pub fn held_by(&self, draft_ok: bool) -> Option<String> {
         if self.starts == 0 {
             return Some("pi has not started its session yet".into());
         }
@@ -149,7 +153,7 @@ impl PiState {
         if self.dialogs > 0 {
             return Some("dialog open".into());
         }
-        if self.draft {
+        if self.draft && !draft_ok {
             return Some("unsent text in the prompt".into());
         }
         None
@@ -258,13 +262,14 @@ mod tests {
         let file = dir.join("s.jsonl");
         fs::write(&file, "{}\n").unwrap();
         let idle = PiState { starts: 1, session_file: Some(file.to_string_lossy().into()), ..Default::default() };
-        assert_eq!(idle.held_by(), None);
-        assert!(PiState { busy: true, ..idle.clone() }.held_by().is_some());
-        assert!(PiState { draft: true, ..idle.clone() }.held_by().is_some());
-        assert!(PiState { pending: true, ..idle.clone() }.held_by().is_some());
-        assert!(PiState { dialogs: 1, ..idle.clone() }.held_by().is_some());
-        assert!(PiState { session_file: None, ..idle.clone() }.held_by().is_some());
-        assert!(PiState { session_file: Some(dir.join("missing").to_string_lossy().into()), ..idle }.held_by().is_some());
+        assert_eq!(idle.held_by(false), None);
+        assert!(PiState { busy: true, ..idle.clone() }.held_by(false).is_some());
+        assert!(PiState { draft: true, ..idle.clone() }.held_by(false).is_some());
+        assert_eq!(PiState { draft: true, ..idle.clone() }.held_by(true), None); // sleeps with it
+        assert!(PiState { pending: true, ..idle.clone() }.held_by(false).is_some());
+        assert!(PiState { dialogs: 1, ..idle.clone() }.held_by(false).is_some());
+        assert!(PiState { session_file: None, ..idle.clone() }.held_by(false).is_some());
+        assert!(PiState { session_file: Some(dir.join("missing").to_string_lossy().into()), ..idle }.held_by(false).is_some());
         let _ = fs::remove_dir_all(dir);
     }
 }

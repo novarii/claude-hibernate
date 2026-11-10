@@ -64,11 +64,14 @@ pub struct Config {
     /// Compact a big sleeping conversation before its prompt cache expires,
     /// as Claude does to an idle one it still has open.
     pub compact_while_asleep: bool,
+    /// Sleep with unsent text in the prompt, show it on the sleep screen and
+    /// put it back on wake; false keeps such a session awake.
+    pub sleep_with_draft: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { idle_minutes: 30.0, enabled: true, exclude_dirs: vec![], real_claude: None, real_pi: None, compact_while_asleep: true }
+        Self { idle_minutes: 30.0, enabled: true, exclude_dirs: vec![], real_claude: None, real_pi: None, compact_while_asleep: true, sleep_with_draft: true }
     }
 }
 
@@ -264,4 +267,6 @@ pub fn cleanup(pid: u32) {
     let _ = fs::remove_file(HookState::path(pid));
     let _ = fs::remove_file(HookState::path(pid).with_extension("lock"));
     let _ = fs::remove_file(crate::pi::PiState::path(pid));
+    let _ = fs::remove_file(crate::draft::out_path(pid));
+    let _ = fs::remove_file(crate::draft::in_path(pid));
 }

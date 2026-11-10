@@ -34,7 +34,7 @@ use nix::unistd::Pid;
 
 use crate::state::{Config, HookState, Status, now};
 use crate::pi::{self, PiState};
-use crate::{args, compact, detect, herdr, hook};
+use crate::{args, compact, detect, draft, herdr, hook};
 
 nix::ioctl_read_bad!(get_winsize, libc::TIOCGWINSZ, Winsize);
 nix::ioctl_write_ptr_bad!(set_winsize, libc::TIOCSWINSZ, Winsize);
@@ -52,6 +52,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Screen changes closer together than this are one burst of activity.
 const BURST_GAP: Duration = Duration::from_secs(5);
 const KILL_GRACE: Duration = Duration::from_secs(15);
+/// How long a resumed agent has to put the draft back before it is pasted.
+const DRAFT_WAIT: Duration = Duration::from_secs(8);
 /// Turn off the terminal modes claude may have left on: kitty keyboard,
 /// bracketed paste, mouse and focus reporting, alternate screen; show the cursor.
 const RESET_MODES: &str = "\x1b[<u\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?1049l\x1b[?25h\x1b[0m";
@@ -241,6 +243,9 @@ pub struct Session {
     /// went to sleep, and the last activity the extension reported.
     pi_resume: Option<(String, PathBuf)>,
     pi_seen_event: f64,
+    /// Unsent text the prompt held when the session went to sleep: shown on
+    /// the sleep screen and put back on wake.
+    draft: Option<String>,
 }
 
 fn stdin() -> BorrowedFd<'static> {
@@ -342,6 +347,7 @@ impl Session {
             resume_mode: None,
             pi_resume: None,
             pi_seen_event: 0.0,
+            draft: None,
         })
     }
 
@@ -371,12 +377,21 @@ impl Session {
             argv.push("--settings".into());
             argv.push(hook::settings_json(&self.exe, &HookState::path(self.me)));
         }
-        if self.agent == Agent::Pi {
-            // Explicit -e paths load even with --no-extensions.
-            argv.push("-e".into());
-            argv.push(pi::extension_path().to_string_lossy().into_owned());
+        match self.agent {
+            Agent::Pi => {
+                // Explicit -e paths load even with --no-extensions.
+                argv.push("-e".into());
+                argv.push(pi::extension_path().to_string_lossy().into_owned());
+            }
+            Agent::Claude => {
+                // Reports the prompt draft and puts it back on resume.
+                argv.push("--plugin-dir".into());
+                argv.push(draft::claude_mod_dir().to_string_lossy().into_owned());
+            }
         }
         argv.extend_from_slice(claude_args);
+        // A report is this process's: never one left by the one before.
+        let _ = std::fs::remove_file(draft::out_path(self.me));
         let slave = pty.slave;
         // A leader process owns the PTY session and runs claude beneath it;
         // see leader.rs for why claude cannot lead the session itself.
@@ -391,6 +406,10 @@ impl Session {
             .env("CLAUDE_HIBERNATE_ARG0", self.agent.name());
         if self.agent == Agent::Pi {
             cmd.env(pi::STATE_ENV, PiState::path(self.me));
+        }
+        cmd.env(draft::OUT_ENV, draft::out_path(self.me)).env_remove(draft::IN_ENV);
+        if draft::in_path(self.me).exists() {
+            cmd.env(draft::IN_ENV, draft::in_path(self.me));
         }
         if let Some(dir) = cwd.filter(|d| d.is_dir()) {
             cmd.current_dir(dir);
@@ -582,6 +601,12 @@ impl Session {
         self.status.since = now();
         self.compacted_at = None;
         let id = self.status.session_id.clone().unwrap_or_default();
+        if self.agent == Agent::Pi && self.cfg.sleep_with_draft {
+            self.draft = self.last_draft().or(self.draft.take());
+        }
+        if let Some(d) = &self.draft {
+            log(&format!("asleep with a draft of {} chars", d.len()));
+        }
         if self.agent == Agent::Claude {
             self.resume_mode = crate::state::transcript_path(&id).and_then(|t| crate::state::last_permission_mode(&t, &id));
             self.compact_plan = compact::plan(&id, &self.cwd);
@@ -661,13 +686,13 @@ impl Session {
     /// show the result.
     fn check_ready(&mut self) {
         let Some(w) = &self.waking else { return };
-        let elapsed = w.since.elapsed();
+        let (elapsed, starts_before) = (w.since.elapsed(), w.starts_before);
         if self.last_output.elapsed() < READY_QUIET && elapsed < READY_TIMEOUT {
             return;
         }
         let (ready, state) = match self.agent {
             Agent::Claude => {
-                let started = !self.track_timers || self.hooks().session_starts > w.starts_before;
+                let started = !self.track_timers || self.hooks().session_starts > starts_before;
                 // Ready once claude has drawn its prompt box and is not busy. An
                 // empty screen also classifies as idle, so the box is required.
                 let text = self.screen_text();
@@ -682,6 +707,26 @@ impl Session {
                 (st.starts > 0 && !st.busy && st.dialogs == 0, state)
             }
         };
+        if ready && self.draft.is_some() {
+            // The draft goes back before any held key, so those land after it.
+            match self.draft_restored() {
+                None if elapsed < DRAFT_WAIT => return,
+                Some(true) => log("draft put back"),
+                _ => {
+                    // The mod or extension couldn't: paste it, newlines as
+                    // newlines (bracketed paste), never as Enter.
+                    log("draft not put back by the agent; pasting it");
+                    let bracketed = self.parser.screen().bracketed_paste();
+                    if let (Some(d), Some(c)) = (&self.draft, &self.child) {
+                        write_all(c.master.as_raw_fd(), &draft::paste(d, bracketed));
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                    self.pump_output(&mut vec![0u8; 64 * 1024]);
+                }
+            }
+            self.draft = None;
+            let _ = std::fs::remove_file(draft::in_path(self.me));
+        }
         if ready {
             log(&format!("ready after {:.2}s", elapsed.as_secs_f64()));
             let held = std::mem::take(&mut self.waking.as_mut().unwrap().held_input);
@@ -698,13 +743,16 @@ impl Session {
         // A login, trust or other dialog came up first: show it and pass keys
         // through. The held input waits for the prompt box.
         if state == detect::State::Blocked || elapsed >= REVEAL_AFTER {
-            if !w.revealed {
+            if !self.waking.as_ref().is_some_and(|w| w.revealed) {
                 log(&format!("revealed after {:.2}s: {} is {state:?}", elapsed.as_secs_f64(), self.agent.name()));
             }
             self.reveal();
         }
         // Never type held keys into whatever is on screen now.
         if elapsed >= READY_TIMEOUT {
+            if self.draft.take().is_some() {
+                log(&format!("not ready in time; the draft is left in {}", draft::in_path(self.me).display()));
+            }
             log("not ready in time; held input dropped");
             self.finish_waking();
         }
@@ -787,6 +835,41 @@ impl Session {
         self.status.save();
     }
 
+    /// Whether a Claude draft keeps the session awake, and why.
+    fn claude_draft_hold(&self) -> Option<String> {
+        let held = Some("unsent text in the prompt".to_string());
+        if !self.cfg.sleep_with_draft {
+            return held;
+        }
+        let Some(report) = draft::ClaudeReport::load(&draft::out_path(self.me)) else {
+            return held; // the mod isn't reporting (an older Claude, mods off)
+        };
+        if report.at / 1000.0 < self.last_input_at {
+            return Some("typing".into()); // keys the mod hasn't seen yet
+        }
+        draft::unrestorable(&report.text).map(|why| format!("unsent text in the prompt ({why})"))
+    }
+
+    /// The draft as last reported: read just before stopping the agent
+    /// (which held_by checked is newer than the last key), and for pi again
+    /// once it exited, from its shutdown report.
+    fn last_draft(&self) -> Option<String> {
+        let text = match self.agent {
+            Agent::Claude => draft::ClaudeReport::load(&draft::out_path(self.me))?.text,
+            Agent::Pi => self.pi_state().draft_text,
+        };
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// While waking with a draft: put back yet, or given up on (and pasted).
+    fn draft_restored(&self) -> Option<bool> {
+        let restored = match self.agent {
+            Agent::Claude => draft::ClaudeReport::load(&draft::out_path(self.me)).map_or(0.0, |r| r.restored),
+            Agent::Pi => self.pi_state().draft_restored,
+        };
+        (restored != 0.0).then_some(restored > 0.0)
+    }
+
     /// pi's idle clock runs from the last key typed and the last thing the
     /// extension reported (a prompt, a run ending, compaction), not from the
     /// screen: pi's footer and prompt-cache refreshes are not use.
@@ -825,7 +908,8 @@ impl Session {
         }
         if self.agent == Agent::Pi {
             let st = self.pi_state();
-            if let Some(why) = st.held_by() {
+            let draft_ok = self.cfg.sleep_with_draft && st.polled_at >= self.last_input_at;
+            if let Some(why) = st.held_by(draft_ok) {
                 return Some(why);
             }
             let pid = self.child.as_ref().and_then(|c| c.claude);
@@ -865,12 +949,14 @@ impl Session {
         }
         // Typed since the last submitted prompt: unless the prompt box is
         // visibly empty, assume a draft is waiting.
+        // With the mod's report of the box, newer than the last key, the
+        // draft sleeps and comes back with the session.
         if self.last_input_at > hooks.last_submit {
             let text = self.screen_text();
             let empty = detect::prompt_box_body(&text)
                 .is_some_and(detect::prompt_is_empty);
-            if !empty {
-                return Some("unsent text in the prompt".into());
+            if !empty && let Some(why) = self.claude_draft_hold() {
+                return Some(why);
             }
         }
         if self.child.as_ref().and_then(|c| c.claude).is_some_and(has_tool_processes) {
@@ -965,6 +1051,7 @@ impl Session {
         }
         let pid = child.pid;
         self.status.freed_kb = rss_kb(pid) + child.claude.map(rss_kb).unwrap_or(0);
+        self.draft = if self.cfg.sleep_with_draft { self.last_draft() } else { None };
         if self.agent == Agent::Pi {
             let st = self.pi_state();
             let cwd = st.cwd.map(PathBuf::from).unwrap_or_else(|| self.cwd.clone());
@@ -1028,8 +1115,16 @@ impl Session {
             format!("  asleep since {since}{freed}"),
             self.compacted_at.map(|t| format!("  compacted at {}, before the prompt cache expired", chrono_like(t))).unwrap_or_default(),
             String::new(),
-            "  press any key to resume".to_string(),
-        ] {
+        ]
+        .into_iter()
+        .chain(self.draft.as_deref().map(|d| {
+            let mut lines = vec!["  unsent draft, back in the prompt on wake:".to_string()];
+            lines.extend(draft::preview(d, cols, 8));
+            lines.push(String::new());
+            lines
+        }).unwrap_or_default())
+        .chain(["  press any key to resume".to_string()])
+        {
             s.extend(line.chars().take(cols));
             s.push_str("\r\n");
         }
@@ -1087,6 +1182,12 @@ impl Session {
                 (argv, Some(cwd))
             }
         };
+        match &self.draft {
+            Some(d) => draft::write_in(self.me, d),
+            None => {
+                let _ = std::fs::remove_file(draft::in_path(self.me));
+            }
+        }
         log(&format!("resume with {argv:?}"));
         self.waking = Some(Waking { since: Instant::now(), starts_before, held_input, output: vec![], revealed: false });
         self.draw_waking_screen();

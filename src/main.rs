@@ -7,6 +7,7 @@
 
 mod args;
 mod detect;
+mod draft;
 mod cli;
 mod compact;
 mod herdr;
