@@ -59,6 +59,8 @@ pub struct Config {
     pub exclude_dirs: Vec<String>,
     /// The real claude binary; found on PATH when unset.
     pub real_claude: Option<String>,
+    /// The real pi binary; found on PATH when unset.
+    pub real_pi: Option<String>,
     /// Compact a big sleeping conversation before its prompt cache expires,
     /// as Claude does to an idle one it still has open.
     pub compact_while_asleep: bool,
@@ -66,7 +68,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { idle_minutes: 30.0, enabled: true, exclude_dirs: vec![], real_claude: None, compact_while_asleep: true }
+        Self { idle_minutes: 30.0, enabled: true, exclude_dirs: vec![], real_claude: None, real_pi: None, compact_while_asleep: true }
     }
 }
 
@@ -149,6 +151,8 @@ impl HookState {
 #[serde(default)]
 pub struct Status {
     pub pid: u32,
+    /// "claude" or "pi"; empty in files written before pi support (claude).
+    pub agent: String,
     pub cwd: String,
     pub session_id: Option<String>,
     pub title: String,
@@ -160,7 +164,7 @@ pub struct Status {
     /// The last `claude-hibernate sleep` request that was refused: (when, why).
     pub refused: Option<(f64, String)>,
     pub child_pid: Option<u32>,
-    /// claude's RSS just before it was stopped, for `status` savings.
+    /// The agent's RSS just before it was stopped, for `status` savings.
     pub freed_kb: u64,
     pub herdr_pane: Option<String>,
 }
@@ -259,4 +263,5 @@ pub fn cleanup(pid: u32) {
     let _ = fs::remove_file(Status::path(pid));
     let _ = fs::remove_file(HookState::path(pid));
     let _ = fs::remove_file(HookState::path(pid).with_extension("lock"));
+    let _ = fs::remove_file(crate::pi::PiState::path(pid));
 }

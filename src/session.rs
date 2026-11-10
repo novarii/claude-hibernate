@@ -7,6 +7,10 @@
 //!
 //! Input that wakes the session is held and written to claude once it is
 //! ready, so nothing typed during the resume is lost.
+//!
+//! pi runs under the same wrapper. Its state comes from the extension in
+//! pi.rs instead of Claude's hooks and screen rules, and it resumes with
+//! `pi --session <file>`.
 
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroU16;
@@ -29,6 +33,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::state::{Config, HookState, Status, now};
+use crate::pi::{self, PiState};
 use crate::{args, compact, detect, herdr, hook};
 
 nix::ioctl_read_bad!(get_winsize, libc::TIOCGWINSZ, Winsize);
@@ -118,6 +123,22 @@ fn new_parser(ws: &Winsize) -> vt100::Parser<TitleCb> {
     vt100::Parser::new_with_callbacks(nz(ws.ws_row), nz(ws.ws_col), 0, TitleCb::default())
 }
 
+/// The program the wrapper runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    Claude,
+    Pi,
+}
+
+impl Agent {
+    pub fn name(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude",
+            Agent::Pi => "pi",
+        }
+    }
+}
+
 struct Signals {
     winch: Arc<AtomicBool>,
     chld: Arc<AtomicBool>,
@@ -183,6 +204,7 @@ struct Waking {
 }
 
 pub struct Session {
+    agent: Agent,
     real: PathBuf,
     args: Vec<String>,
     exe: String,
@@ -215,6 +237,10 @@ pub struct Session {
     compacted_at: Option<f64>,
     /// The permission mode to wake in, read when it went to sleep.
     resume_mode: Option<String>,
+    /// pi: the session file and working directory to resume, read when it
+    /// went to sleep, and the last activity the extension reported.
+    pi_resume: Option<(String, PathBuf)>,
+    pi_seen_event: f64,
 }
 
 fn stdin() -> BorrowedFd<'static> {
@@ -276,13 +302,14 @@ pub(crate) fn has_tool_processes(pid: Pid) -> bool {
 }
 
 impl Session {
-    pub fn new(real: PathBuf, args: Vec<String>) -> Result<Self> {
+    pub fn new(agent: Agent, real: PathBuf, args: Vec<String>) -> Result<Self> {
         let ws = winsize();
         let exe = std::env::current_exe()?.canonicalize()?.to_string_lossy().into_owned();
         let me = std::process::id();
         let cwd = std::env::current_dir().unwrap_or_default();
         Ok(Self {
-            track_timers: !args::has_own_settings(&args),
+            track_timers: agent == Agent::Claude && !args::has_own_settings(&args),
+            agent,
             real,
             args,
             exe,
@@ -301,6 +328,7 @@ impl Session {
             last_input_at: 0.0,
             status: Status {
                 pid: me,
+                agent: agent.name().into(),
                 cwd: cwd.to_string_lossy().into_owned(),
                 since: now(),
                 herdr_pane: herdr::pane(),
@@ -312,7 +340,13 @@ impl Session {
             compactor: None,
             compacted_at: None,
             resume_mode: None,
+            pi_resume: None,
+            pi_seen_event: 0.0,
         })
+    }
+
+    fn pi_state(&self) -> PiState {
+        PiState::load(&PiState::path(self.me))
     }
 
     fn hooks(&self) -> HookState {
@@ -329,13 +363,18 @@ impl Session {
         let _ = termios::tcsetattr(stdin(), SetArg::TCSANOW, &self.orig_termios);
     }
 
-    fn spawn(&mut self, claude_args: &[String]) -> Result<()> {
+    fn spawn(&mut self, claude_args: &[String], cwd: Option<&std::path::Path>) -> Result<()> {
         let ws = winsize();
         let pty = openpty(Some(&ws), None)?;
         let mut argv: Vec<String> = vec![];
         if self.track_timers {
             argv.push("--settings".into());
             argv.push(hook::settings_json(&self.exe, &HookState::path(self.me)));
+        }
+        if self.agent == Agent::Pi {
+            // Explicit -e paths load even with --no-extensions.
+            argv.push("-e".into());
+            argv.push(pi::extension_path().to_string_lossy().into_owned());
         }
         argv.extend_from_slice(claude_args);
         let slave = pty.slave;
@@ -348,7 +387,14 @@ impl Session {
             .stdin(slave.try_clone()?)
             .stdout(slave.try_clone()?)
             .stderr(slave.try_clone()?)
-            .env("CLAUDE_HIBERNATE_PID", self.me.to_string());
+            .env("CLAUDE_HIBERNATE_PID", self.me.to_string())
+            .env("CLAUDE_HIBERNATE_ARG0", self.agent.name());
+        if self.agent == Agent::Pi {
+            cmd.env(pi::STATE_ENV, PiState::path(self.me));
+        }
+        if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+            cmd.current_dir(dir);
+        }
         unsafe {
             cmd.pre_exec(|| {
                 nix::unistd::setsid()?;
@@ -369,10 +415,12 @@ impl Session {
 
     pub fn run(mut self) -> Result<i32> {
         let signals = Signals::install()?;
-        detect::refresh_in_background();
+        if self.agent == Agent::Claude {
+            detect::refresh_in_background();
+        }
         self.raw_mode();
         let first_args = self.args.clone();
-        if let Err(e) = self.spawn(&first_args) {
+        if let Err(e) = self.spawn(&first_args, None) {
             self.cooked_mode();
             return Err(e);
         }
@@ -469,7 +517,7 @@ impl Session {
                 w.revealed = true;
                 out(b"\x1b[2J\x1b[H");
                 out(&std::mem::take(&mut w.output));
-                herdr::mark_awake();
+                herdr::mark_awake(self.agent.name());
             }
     }
 
@@ -534,13 +582,15 @@ impl Session {
         self.status.since = now();
         self.compacted_at = None;
         let id = self.status.session_id.clone().unwrap_or_default();
-        self.resume_mode = crate::state::transcript_path(&id).and_then(|t| crate::state::last_permission_mode(&t, &id));
-        self.compact_plan = compact::plan(&id, &self.cwd);
-        if let Some(p) = &self.compact_plan {
-            log(&format!("will compact {} tokens in {:.0}s", p.tokens, p.at - now()));
+        if self.agent == Agent::Claude {
+            self.resume_mode = crate::state::transcript_path(&id).and_then(|t| crate::state::last_permission_mode(&t, &id));
+            self.compact_plan = compact::plan(&id, &self.cwd);
+            if let Some(p) = &self.compact_plan {
+                log(&format!("will compact {} tokens in {:.0}s", p.tokens, p.at - now()));
+            }
         }
         self.draw_sleep_screen();
-        herdr::mark_asleep();
+        herdr::mark_asleep(self.agent.name());
         self.status.save();
         None
     }
@@ -597,6 +647,10 @@ impl Session {
     }
 
     fn title(&self) -> String {
+        if self.agent == Agent::Pi {
+            let t = self.pi_state().title.unwrap_or_default();
+            return if t.is_empty() { self.status.session_id.clone().unwrap_or_default() } else { t };
+        }
         let t = self.parser.callbacks().title.trim();
         // Drop claude's status glyph (spinner, ✳) before the session title.
         let t = t.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
@@ -611,12 +665,24 @@ impl Session {
         if self.last_output.elapsed() < READY_QUIET && elapsed < READY_TIMEOUT {
             return;
         }
-        let started = !self.track_timers || self.hooks().session_starts > w.starts_before;
-        // Ready once claude has drawn its prompt box and is not busy. An
-        // empty screen also classifies as idle, so the box is required.
-        let text = self.screen_text();
-        let state = self.detect().state;
-        if started && state == detect::State::Idle && detect::prompt_box_body(&text).is_some() {
+        let (ready, state) = match self.agent {
+            Agent::Claude => {
+                let started = !self.track_timers || self.hooks().session_starts > w.starts_before;
+                // Ready once claude has drawn its prompt box and is not busy. An
+                // empty screen also classifies as idle, so the box is required.
+                let text = self.screen_text();
+                let state = self.detect().state;
+                (started && state == detect::State::Idle && detect::prompt_box_body(&text).is_some(), state)
+            }
+            Agent::Pi => {
+                // The state file was cleared before the resume: a session_start
+                // in it is the new pi's, and pi has drawn its editor once quiet.
+                let st = self.pi_state();
+                let state = if st.dialogs > 0 { detect::State::Blocked } else { detect::State::Unknown };
+                (st.starts > 0 && !st.busy && st.dialogs == 0, state)
+            }
+        };
+        if ready {
             log(&format!("ready after {:.2}s", elapsed.as_secs_f64()));
             let held = std::mem::take(&mut self.waking.as_mut().unwrap().held_input);
             if !held.is_empty() {
@@ -633,7 +699,7 @@ impl Session {
         // through. The held input waits for the prompt box.
         if state == detect::State::Blocked || elapsed >= REVEAL_AFTER {
             if !w.revealed {
-                log(&format!("revealed after {:.2}s: claude is {state:?}", elapsed.as_secs_f64()));
+                log(&format!("revealed after {:.2}s: {} is {state:?}", elapsed.as_secs_f64(), self.agent.name()));
             }
             self.reveal();
         }
@@ -673,6 +739,10 @@ impl Session {
         {
             c.claude = child_of(c.pid);
             self.status.child_pid = c.claude.map(|p| p.as_raw() as u32);
+        }
+        if self.agent == Agent::Pi {
+            self.tick_pi();
+            return;
         }
 
         // Claude compacting the conversation on its own, as it does to an
@@ -717,6 +787,34 @@ impl Session {
         self.status.save();
     }
 
+    /// pi's idle clock runs from the last key typed and the last thing the
+    /// extension reported (a prompt, a run ending, compaction), not from the
+    /// screen: pi's footer and prompt-cache refreshes are not use.
+    fn tick_pi(&mut self) {
+        let st = self.pi_state();
+        if st.last_event > self.pi_seen_event {
+            self.pi_seen_event = st.last_event;
+            let ago = Duration::from_secs_f64((now() - st.last_event).max(0.0));
+            let at = Instant::now().checked_sub(ago).unwrap_or_else(Instant::now);
+            self.last_activity = self.last_activity.max(at);
+            self.status.held_by = None; // re-evaluated once idle again
+        }
+        if st.busy || st.compacting || st.dialogs > 0 {
+            self.last_activity = Instant::now();
+        }
+        if st.session_id.is_some() {
+            self.status.session_id = st.session_id.clone();
+        }
+        self.status.title = self.title();
+        self.cfg = Config::load();
+        let idle = self.last_activity.elapsed().as_secs_f64();
+        if idle >= self.cfg.idle_minutes * 60.0 {
+            self.try_hibernate(false);
+        }
+        self.status.since = now() - idle;
+        self.status.save();
+    }
+
     /// Why the session cannot sleep right now, if anything.
     fn held_by(&self) -> Option<String> {
         if !self.cfg.enabled {
@@ -724,6 +822,14 @@ impl Session {
         }
         if self.cfg.excludes(&self.cwd) {
             return Some("excluded directory".into());
+        }
+        if self.agent == Agent::Pi {
+            let st = self.pi_state();
+            if let Some(why) = st.held_by() {
+                return Some(why);
+            }
+            let pid = self.child.as_ref().and_then(|c| c.claude);
+            return pid.and_then(|p| pi::work_in_children(p.as_raw() as u32, st.first_work)).map(|c| format!("running {c}"));
         }
         if !self.track_timers {
             return Some("--settings passed; cannot track timers".into());
@@ -859,6 +965,12 @@ impl Session {
         }
         let pid = child.pid;
         self.status.freed_kb = rss_kb(pid) + child.claude.map(rss_kb).unwrap_or(0);
+        if self.agent == Agent::Pi {
+            let st = self.pi_state();
+            let cwd = st.cwd.map(PathBuf::from).unwrap_or_else(|| self.cwd.clone());
+            self.pi_resume = st.session_file.map(|f| (f, cwd));
+            self.status.session_id = st.session_id.or(self.status.session_id.take());
+        }
         self.status.title = self.title();
         if let Some(c) = &mut self.child {
             c.stopping_since = Some(Instant::now());
@@ -886,7 +998,7 @@ impl Session {
             write_all(fd, &data[start..i]);
             std::thread::sleep(Duration::from_millis(250));
             self.pump_output(&mut buf);
-            if agents_panel_open(&self.screen_text()) {
+            if self.agent == Agent::Claude && agents_panel_open(&self.screen_text()) {
                 write_all(fd, b"\x1b");
                 return;
             }
@@ -947,6 +1059,9 @@ impl Session {
 
     fn wake(&mut self, held_input: Vec<u8>) {
         let Some(id) = self.status.session_id.clone() else { return };
+        if self.agent == Agent::Pi && self.pi_resume.is_none() {
+            return;
+        }
         log(&format!("wake input {:?}", String::from_utf8_lossy(&held_input)));
         self.stop_compacting();
         self.compact_plan = None;
@@ -955,13 +1070,27 @@ impl Session {
         self.status.freed_kb = 0;
         let hooks = self.hooks();
         let starts_before = hooks.session_starts;
-        let mut argv = args::for_resume(&self.args, self.resume_mode.as_deref(), &hooks.added_dirs);
-        argv.push("--resume".into());
-        argv.push(id);
+        let (argv, cwd) = match self.agent {
+            Agent::Claude => {
+                let mut argv = args::for_resume(&self.args, self.resume_mode.as_deref(), &hooks.added_dirs);
+                argv.push("--resume".into());
+                argv.push(id);
+                (argv, None)
+            }
+            Agent::Pi => {
+                let Some((file, cwd)) = self.pi_resume.clone() else { return };
+                // The next session_start in it is the resumed pi's.
+                let _ = std::fs::remove_file(PiState::path(self.me));
+                let mut argv = pi::resume_args(&self.args);
+                argv.push("--session".into());
+                argv.push(file);
+                (argv, Some(cwd))
+            }
+        };
         log(&format!("resume with {argv:?}"));
         self.waking = Some(Waking { since: Instant::now(), starts_before, held_input, output: vec![], revealed: false });
         self.draw_waking_screen();
-        if let Err(e) = self.spawn(&argv) {
+        if let Err(e) = self.spawn(&argv, cwd.as_deref()) {
             self.waking = None;
             out(format!("\r\nclaude-hibernate: could not resume: {e:#}\r\n").as_bytes());
             self.asleep = true;

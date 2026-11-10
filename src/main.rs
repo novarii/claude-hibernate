@@ -1,7 +1,8 @@
-//! claude-hibernate: free the memory of idle Claude Code sessions.
+//! claude-hibernate: free the memory of idle Claude Code (and pi) sessions.
 //!
-//! Invoked through a `claude` symlink it is the shim: interactive sessions run
-//! under the hibernating wrapper, everything else execs the real claude.
+//! Invoked through a `claude` or `pi` symlink it is the shim: interactive
+//! sessions run under the hibernating wrapper, everything else execs the real
+//! program.
 //! Invoked as `claude-hibernate` it is the management CLI.
 
 mod args;
@@ -12,6 +13,7 @@ mod herdr;
 mod hook;
 mod leader;
 mod migrate;
+mod pi;
 mod session;
 mod state;
 
@@ -24,12 +26,14 @@ claude-hibernate: free the memory of idle Claude Code sessions
 usage:
   claude [args...]                   via the shim: run Claude, hibernate when idle
   claude-hibernate run [args...]     same, without the shim
+  pi [args...]                       via the `pi` shim: the same for pi sessions
+  claude-hibernate pi [args...]      same, without the shim
   claude-hibernate status [--json|--watch]  wrapped sessions, their state and memory
   claude-hibernate sleep <pid|id|pane|--current|all>  hibernate now (if nothing holds it awake)
   claude-hibernate wake <pid|id|pane|--current|all>   resume a hibernated session
   claude-hibernate migrate [--dry-run|--confirm] [--only PANE...] [--exclude PANE...]
                                      move claude agents already running in herdr panes under the wrapper
-  claude-hibernate install [--write-rc]  put the `claude` shim on PATH
+  claude-hibernate install [--write-rc]  put the `claude` (and `pi`) shims on PATH
   claude-hibernate uninstall
   claude-hibernate config            show the effective config
 ";
@@ -42,7 +46,18 @@ fn shim(args: Vec<String>) -> anyhow::Result<i32> {
         let err = std::process::Command::new(&real).arg0("claude").args(&args).exec();
         anyhow::bail!("exec {}: {err}", real.display());
     }
-    session::Session::new(real, args)?.run()
+    session::Session::new(session::Agent::Claude, real, args)?.run()
+}
+
+fn pi_shim(args: Vec<String>) -> anyhow::Result<i32> {
+    let cfg = state::Config::load();
+    let real = args::find_real_pi(cfg.real_pi.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("claude-hibernate: real `pi` not found (set real_pi in {})", state::config_path().display()))?;
+    if !pi::wants_wrapping(&args) {
+        let err = std::process::Command::new(&real).arg0("pi").args(&args).exec();
+        anyhow::bail!("exec {}: {err}", real.display());
+    }
+    session::Session::new(session::Agent::Pi, real, args)?.run()
 }
 
 fn main() {
@@ -53,10 +68,13 @@ fn main() {
 
     let result = if invoked_as == "claude" {
         shim(rest)
+    } else if invoked_as == "pi" {
+        pi_shim(rest)
     } else {
         let (cmd, tail) = rest.split_first().map(|(c, t)| (c.as_str(), t.to_vec())).unwrap_or(("", vec![]));
         match cmd {
             "run" => shim(tail),
+            "pi" => pi_shim(tail),
             "__pty-leader" if !tail.is_empty() => Ok(leader::run(&tail[0], &tail[1..])),
             "__migrate-later" if tail.len() == 1 => Ok(migrate::run_later(&tail[0])),
             "__detect" => {

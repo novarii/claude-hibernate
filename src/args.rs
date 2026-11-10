@@ -130,20 +130,39 @@ fn is_executable(p: &Path) -> bool {
 /// The real claude: config, then PATH (skipping anything that resolves to
 /// us), then well-known install locations.
 pub fn find_real_claude(configured: Option<&str>) -> Option<PathBuf> {
+    find_real(
+        "claude",
+        configured,
+        &[".local/bin/claude", ".claude/local/claude", ".local/share/fnm/aliases/default/bin/claude"],
+        &["/usr/local/bin/claude", "/opt/homebrew/bin/claude"],
+    )
+}
+
+/// The real pi, found the same way.
+pub fn find_real_pi(configured: Option<&str>) -> Option<PathBuf> {
+    find_real(
+        "pi",
+        configured,
+        &[".local/bin/pi", ".npm-global/bin/pi", ".local/share/fnm/aliases/default/bin/pi", ".bun/bin/pi"],
+        &["/usr/local/bin/pi", "/opt/homebrew/bin/pi", "/usr/bin/pi"],
+    )
+}
+
+fn find_real(name: &str, configured: Option<&str>, home_rel: &[&str], absolute: &[&str]) -> Option<PathBuf> {
     let me = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
     let not_me = |p: &Path| is_executable(p) && p.canonicalize().ok() != me;
     if let Some(c) = configured.map(PathBuf::from).filter(|p| not_me(p)) {
         return Some(c);
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
-    if let Some(found) = std::env::split_paths(&path).map(|d| d.join("claude")).find(|p| not_me(p)) {
+    if let Some(found) = std::env::split_paths(&path).map(|d| d.join(name)).find(|p| not_me(p)) {
         return Some(found);
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    [".local/bin/claude", ".claude/local/claude", ".local/share/fnm/aliases/default/bin/claude"]
+    home_rel
         .iter()
         .map(|rel| home.join(rel))
-        .chain(["/usr/local/bin/claude", "/opt/homebrew/bin/claude"].map(PathBuf::from))
+        .chain(absolute.iter().map(PathBuf::from))
         .find(|p| not_me(p))
 }
 

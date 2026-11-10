@@ -1,7 +1,7 @@
 //! Optional integration with herdr (https://herdr.dev), active when the
 //! wrapper runs inside a herdr pane. Herdr already recognizes the wrapper as a
-//! `claude` agent because it is invoked through a `claude` symlink; this only
-//! adds a sidebar label while the session sleeps.
+//! `claude` (or `pi`) agent because it is invoked through a symlink of that
+//! name; this only adds a sidebar label while the session sleeps.
 
 use std::process::{Command, Stdio};
 
@@ -30,16 +30,16 @@ fn hc_label(value: &str) {
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
-pub fn mark_asleep() {
+pub fn mark_asleep(agent: &str) {
     hc_label("1");
     if let Some(p) = pane() {
-        herdr(&["pane", "report-metadata", &p, "--source", "claude-hibernate", "--agent", "claude", "--state-label", "idle=💤 hibernated"]);
+        herdr(&["pane", "report-metadata", &p, "--source", "claude-hibernate", "--agent", agent, "--state-label", "idle=💤 hibernated"]);
     }
 }
 
-pub fn mark_awake() {
+pub fn mark_awake(agent: &str) {
     hc_label("");
     if let Some(p) = pane() {
-        herdr(&["pane", "report-metadata", &p, "--source", "claude-hibernate", "--agent", "claude", "--clear-state-labels"]);
+        herdr(&["pane", "report-metadata", &p, "--source", "claude-hibernate", "--agent", agent, "--clear-state-labels"]);
     }
 }

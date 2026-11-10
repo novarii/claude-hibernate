@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use crate::args::find_real_claude;
+use crate::args::{find_real_claude, find_real_pi};
 use crate::herdr;
 use crate::state::{Config, Status, config_path, now, shim_dir};
 
@@ -53,7 +53,7 @@ fn status_table() -> String {
         return "no wrapped sessions running\n".into();
     }
     let mut out = String::new();
-    let _ = writeln!(out, "{:>8}  {:<7} {:>7} {:>8}  {:<28} TITLE", "PID", "STATE", "FOR", "MEMORY", "HELD BY");
+    let _ = writeln!(out, "{:>8}  {:<6} {:<7} {:>7} {:>8}  {:<28} TITLE", "PID", "AGENT", "STATE", "FOR", "MEMORY", "HELD BY");
     let (mut asleep, mut freed, mut used) = (0, 0u64, 0u64);
     for s in &sessions {
         let wrapper = rss_kb(s.pid);
@@ -67,8 +67,9 @@ fn status_table() -> String {
         let title: String = s.title.chars().take(50).collect();
         let _ = writeln!(
             out,
-            "{:>8}  {:<7} {:>7} {:>8}  {:<28} {}",
+            "{:>8}  {:<6} {:<7} {:>7} {:>8}  {:<28} {}",
             s.pid,
+            if s.agent.is_empty() { "claude" } else { s.agent.as_str() },
             state,
             ago(s.since),
             mb(wrapper + child),
@@ -225,15 +226,25 @@ pub fn install(write_rc: bool) -> Result<()> {
     symlink(&exe, &shim)?;
     println!("shim       {} -> {}", shim.display(), exe.display());
     println!("real       {}", real.display());
+    // pi is optional: shim it only where it is installed.
+    let real_pi = find_real_pi(cfg.real_pi.as_deref());
+    if let Some(real_pi) = &real_pi {
+        let pi_shim = dir.join("pi");
+        let _ = std::fs::remove_file(&pi_shim);
+        symlink(&exe, &pi_shim)?;
+        println!("shim       {} -> {}", pi_shim.display(), exe.display());
+        println!("real       {}", real_pi.display());
+    }
 
-    if cfg.real_claude.is_none() {
-        cfg.real_claude = Some(real.to_string_lossy().into_owned());
-        let path = config_path();
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        if !path.exists() {
-            std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
-            println!("config     {}", path.display());
+    let path = config_path();
+    if !path.exists() {
+        cfg.real_claude.get_or_insert_with(|| real.to_string_lossy().into_owned());
+        if let Some(p) = &real_pi {
+            cfg.real_pi.get_or_insert_with(|| p.to_string_lossy().into_owned());
         }
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
+        println!("config     {}", path.display());
     }
 
     let line = format!("export PATH=\"{}:$PATH\"", dir.display()).replace(&std::env::var("HOME").unwrap_or_default(), "$HOME");
@@ -330,9 +341,11 @@ fn rc_file() -> Option<PathBuf> {
 }
 
 pub fn uninstall() -> Result<()> {
-    let shim = shim_dir().join("claude");
-    if std::fs::remove_file(&shim).is_ok() {
-        println!("removed {}", shim.display());
+    for name in ["claude", "pi"] {
+        let shim = shim_dir().join(name);
+        if std::fs::remove_file(&shim).is_ok() {
+            println!("removed {}", shim.display());
+        }
     }
     println!("Running sessions keep their wrapper until they exit. Remove the PATH line from your shell rc if you added one.");
     Ok(())

@@ -1,5 +1,5 @@
-//! `claude-hibernate __pty-leader <claude> [args...]`: the session leader on
-//! the PTY the wrapper owns. It runs claude in its own process group so that
+//! `claude-hibernate __pty-leader <claude|pi> [args...]`: the session leader on
+//! the PTY the wrapper owns. It runs claude (or pi) in its own process group so that
 //! group is not orphaned: the kernel discards a self-sent SIGTSTP in an
 //! orphaned group, which would break Claude's Ctrl+Z. When claude stops, the
 //! leader stops too, which the wrapper sees and turns into a real suspend.
@@ -28,7 +28,8 @@ pub fn run(real: &str, args: &[String]) -> i32 {
         let _ = signal(Signal::SIGTTOU, SigHandler::SigIgn);
     }
     let mut cmd = Command::new(real);
-    cmd.arg0("claude").args(args);
+    let arg0 = std::env::var("CLAUDE_HIBERNATE_ARG0").unwrap_or_else(|_| "claude".into());
+    cmd.arg0(arg0).args(args).env_remove("CLAUDE_HIBERNATE_ARG0");
     unsafe {
         cmd.pre_exec(|| {
             setpgid(Pid::from_raw(0), Pid::from_raw(0))?;

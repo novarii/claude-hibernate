@@ -75,12 +75,13 @@ mode) and directories added with `/add-dir`.
 
 ```
 $ claude-hibernate status
-     PID  STATE    FOR    MEMORY  HELD BY          TITLE
- 3727942  asleep  2h14m     2 MB                   Fix flaky auth test
- 3729120  held      41m   318 MB  cron e3946f1b    Nightly report loop
- 3731877  awake      3m   296 MB                   Refactor billing
+     PID  AGENT  STATE    FOR    MEMORY  HELD BY          TITLE
+ 3727942  claude asleep  2h14m     2 MB                   Fix flaky auth test
+ 3729120  claude held      41m   318 MB  cron e3946f1b    Nightly report loop
+ 3731877  claude awake      3m   296 MB                   Refactor billing
+ 3733410  pi     asleep    52m     2 MB                   Port the parser to Rust
 
-3 sessions, 1 asleep · using 616 MB · freed 312 MB
+4 sessions, 2 asleep · using 618 MB · freed 495 MB
 ```
 
 ```
@@ -128,6 +129,33 @@ replays what you typed. Ctrl+Z, `fg`, resizing, and `claude -p` all work as usua
 
 Works in any terminal, tmux, or SSH session. Inside [herdr](https://herdr.dev),
 sleeping agents keep their name, get a 💤 label, and wake on `herdr agent prompt`.
+
+## pi
+
+The same wrapper hibernates [pi](https://pi.dev) sessions (~180 MB each).
+Where pi is installed, `install` also puts a `pi` shim next to the `claude`
+one, so `pi` starts under it like `claude` does; `claude-hibernate pi [args]`
+does the same without the shim. `status`, `sleep` and `wake` list and control
+both, with an AGENT column telling them apart.
+
+The wrapper loads a small pi extension with `-e` (nothing is added to your pi
+settings). It tells the wrapper which session file to resume and keeps pi
+awake while:
+
+- a prompt is running (`agent_start` until `agent_settled`), or compacting
+- messages are queued, or an extension dialog is open
+- there's unsent text in the editor
+- a `!` command, a bash tool call or a background job is still running
+
+Waking runs `pi --session <file>` with your original flags, minus the session
+pickers and initial prompt. `--model`, `--provider` and `--thinking` are left
+off too, because pi restores the model and thinking level from the session,
+so one you switched with Ctrl+P or `/model` survives a sleep. pi's own
+prompt-cache refreshes don't count as use. `--no-session`, `-p`, `--mode
+json|rpc` and the `pi install`/`config`/... subcommands run pi directly.
+
+pi has no hook for its built-in pickers (`/model`, `/resume`, `/tree`), so one
+left open doesn't hold the session awake; closing it loses nothing.
 
 ## herdr plugin
 
