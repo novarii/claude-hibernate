@@ -161,7 +161,10 @@ awake while:
 
 - a prompt is running (`agent_start` until `agent_settled`), or compacting
 - messages are queued, or an extension dialog is open
-- a `!` command, a bash tool call or a background job is still running
+- work pi started is still running: a tool call (bash, a subagent), a `!`
+  command, or a job of the bash-background extension (it reports jobs on
+  pi's extension event bus). Other child processes, such as MCP servers,
+  never hold it
 
 Waking runs `pi --session <file>` with your original flags, minus the session
 pickers and initial prompt. `--model`, `--provider` and `--thinking` are left

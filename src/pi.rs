@@ -116,7 +116,9 @@ pub struct PiState {
     pub compacting: bool,
     pub last_submit: f64,
     pub last_event: f64,
-    pub first_work: f64,
+    /// Work pi started that is still running (tool calls, `!` commands,
+    /// bash-background jobs), as the extension describes it.
+    pub work: Vec<String>,
 }
 
 impl PiState {
@@ -153,6 +155,12 @@ impl PiState {
         if self.dialogs > 0 {
             return Some("dialog open".into());
         }
+        if let Some(w) = self.work.first() {
+            return Some(match self.work.len() {
+                1 => format!("running {w}"),
+                n => format!("running {w} (+{})", n - 1),
+            });
+        }
         if self.draft && !draft_ok {
             return Some("unsent text in the prompt".into());
         }
@@ -167,46 +175,6 @@ pub fn extension_path() -> PathBuf {
         write_atomic(&path, EXTENSION.as_bytes());
     }
     path
-}
-
-/// Children pi started for work: a `!` command, a bash tool call or a
-/// background job. MCP servers are pi's children too, but pi starts them with
-/// the session, so a child started within this long of pi, and before pi
-/// first ran a tool or `!` command (`first_work`), is taken to be one.
-const MCP_STARTUP_SECS: u64 = 60;
-
-pub fn work_in_children(pid: u32, first_work: f64) -> Option<String> {
-    let o = std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,comm="]).output().ok()?;
-    let text = String::from_utf8_lossy(&o.stdout);
-    let rows: Vec<(u32, u32, u64, String)> = text
-        .lines()
-        .filter_map(|l| {
-            let mut f = l.split_whitespace();
-            let (p, pp, et) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?, parse_etime(f.next()?)?);
-            let comm = f.collect::<Vec<_>>().join(" ");
-            Some((p, pp, et, comm.rsplit('/').next().unwrap_or("").to_string()))
-        })
-        .collect();
-    let age = rows.iter().find(|r| r.0 == pid)?.2;
-    let now = crate::state::now();
-    rows.iter()
-        .find(|r| {
-            let started = now - r.2 as f64;
-            r.1 == pid
-                && (age.saturating_sub(r.2) > MCP_STARTUP_SECS || (first_work > 0.0 && started >= first_work - 1.0))
-        })
-        .map(|r| r.3.clone())
-}
-
-/// `ps` elapsed time: `[[dd-]hh:]mm:ss`.
-fn parse_etime(s: &str) -> Option<u64> {
-    let (days, rest) = match s.split_once('-') {
-        Some((d, r)) => (d.parse::<u64>().ok()?, r),
-        None => (0, s),
-    };
-    let parts: Vec<u64> = rest.split(':').map(|p| p.parse().ok()).collect::<Option<_>>()?;
-    let secs = parts.iter().fold(0, |acc, p| acc * 60 + p);
-    Some(days * 86400 + secs)
 }
 
 #[cfg(test)]
@@ -247,15 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_ps_etime() {
-        assert_eq!(parse_etime("05"), Some(5));
-        assert_eq!(parse_etime("01:05"), Some(65));
-        assert_eq!(parse_etime("02:01:05"), Some(7265));
-        assert_eq!(parse_etime("3-02:01:05"), Some(3 * 86400 + 7265));
-        assert_eq!(parse_etime("x"), None);
-    }
-
-    #[test]
     fn holds_while_pi_has_anything_to_lose() {
         let dir = std::env::temp_dir().join(format!("ch-pi-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -268,6 +227,11 @@ mod tests {
         assert_eq!(PiState { draft: true, ..idle.clone() }.held_by(true), None); // sleeps with it
         assert!(PiState { pending: true, ..idle.clone() }.held_by(false).is_some());
         assert!(PiState { dialogs: 1, ..idle.clone() }.held_by(false).is_some());
+        // Only work pi started holds it; other children (MCP servers) never reach `work`.
+        let job = PiState { work: vec!["background job sleep 300".into()], ..idle.clone() };
+        assert_eq!(job.held_by(true).as_deref(), Some("running background job sleep 300"));
+        let two = PiState { work: vec!["tool bash".into(), "! make".into()], ..idle.clone() };
+        assert_eq!(two.held_by(true).as_deref(), Some("running tool bash (+1)"));
         assert!(PiState { session_file: None, ..idle.clone() }.held_by(false).is_some());
         assert!(PiState { session_file: Some(dir.join("missing").to_string_lossy().into()), ..idle }.held_by(false).is_some());
         let _ = fs::remove_dir_all(dir);

@@ -37,10 +37,25 @@ interface State {
   /** Last prompt the user submitted, and last agent activity (epoch seconds). */
   last_submit: number;
   last_event: number;
-  /** When this pi process first ran a tool or a `!` command: children it
-   *  started from then on may be work, not MCP servers (epoch seconds). */
-  first_work: number;
+  /** Work pi itself started that is still running: tool calls (bash,
+   *  subagents), `!` commands, and bash-background jobs. Any other child
+   *  process (an MCP server, say) is not work. */
+  work: string[];
 }
+
+/** What `work` is built from; kept in memory only. */
+interface Work {
+  /** Tool calls between tool_execution_start and _end, by call id. */
+  tools: Map<string, string>;
+  /** `!` commands not yet recorded in the session (start time, command). */
+  bash: { at: number; command: string }[];
+  /** bash-background jobs reported running, by task id. */
+  jobs: Map<string, string>;
+}
+
+/** bash-background (~/.pi/agent/extensions/bash-background) publishes each
+ *  job's state on pi's extension event bus under this channel. */
+const JOBS_CHANNEL = "aria-local:background-task-update";
 
 // Session replacement (/new, /resume) and reload load a fresh copy of this
 // module in the same process; keep one state across them.
@@ -48,13 +63,35 @@ const g = globalThis as any;
 const state: State = (g.__claudeHibernatePi ??= {
   pid: process.pid, starts: 0, busy: false, pending: false, dialogs: 0,
   draft: false, draft_text: "", polled_at: 0, draft_restored: 0,
-  compacting: false, last_submit: 0, last_event: 0, first_work: 0,
+  compacting: false, last_submit: 0, last_event: 0, work: [],
 });
+const running: Work = (g.__claudeHibernatePiWork ??= { tools: new Map(), bash: [], jobs: new Map() });
+
+function describeWork(): string[] {
+  return [
+    ...[...running.tools.values()].map((t) => `tool ${t}`),
+    ...running.bash.map((b) => `! ${b.command}`),
+    ...[...running.jobs.values()].map((j) => `background job ${j}`),
+  ];
+}
+
+/** pi records a finished `!` command in the session as a bashExecution
+ *  message; it emits no event for it. Drop the commands that have one. */
+function settleBash(ctx: any) {
+  if (running.bash.length === 0) return;
+  let done = 0;
+  for (const e of ctx.sessionManager.getEntries()) {
+    const m = e?.type === "message" ? e.message : undefined;
+    if (m?.role === "bashExecution" && m.timestamp >= running.bash[0].at) done += 1;
+  }
+  running.bash.splice(0, done);
+}
 
 const now = () => Date.now() / 1000;
 let written = "";
 function write() {
   if (!STATE) return;
+  state.work = describeWork();
   const json = JSON.stringify(state);
   if (json === written) return;
   try {
@@ -119,6 +156,7 @@ export default function (pi: any) {
     if (!ctx) return;
     try {
       readEditor(ctx);
+      settleBash(ctx);
       state.pending = ctx.hasPendingMessages();
       if (ctx.isIdle() === false) state.busy = true;
     } catch {
@@ -164,6 +202,12 @@ export default function (pi: any) {
     ctxNow = undefined;
     if (timer) clearInterval(timer);
     timer = undefined;
+    // bash-background kills its jobs at every shutdown (quit, reload, a
+    // session switch) without a final update; tool calls end with the run.
+    running.jobs.clear();
+    running.tools.clear();
+    running.bash.length = 0;
+    write();
   });
   pi.on("session_info_changed", (_e: any, ctx: any) => {
     fromContext(ctx);
@@ -185,15 +229,25 @@ export default function (pi: any) {
     fromContext(ctx);
     write();
   });
-  const work = () => {
-    if (state.first_work === 0) {
-      state.first_work = now();
-      write();
-    }
-  };
-  pi.on("tool_execution_start", work);
-  pi.on("user_bash", () => {
-    work();
+  pi.on("tool_execution_start", (e: any) => {
+    running.tools.set(String(e?.toolCallId), String(e?.toolName ?? "call"));
+    write();
+  });
+  pi.on("tool_execution_end", (e: any) => {
+    running.tools.delete(String(e?.toolCallId));
+    state.last_event = now();
+    write();
+  });
+  pi.on("user_bash", (e: any) => {
+    running.bash.push({ at: Date.now(), command: String(e?.command ?? "").slice(0, 40) });
+    state.last_event = now();
+    write();
+  });
+  pi.events?.on?.(JOBS_CHANNEL, (data: any) => {
+    const t = data?.task;
+    if (!t?.task_id) return;
+    if (t.status === "running") running.jobs.set(String(t.task_id), String(t.label ?? t.task_id).slice(0, 40));
+    else running.jobs.delete(String(t.task_id));
     state.last_event = now();
     write();
   });

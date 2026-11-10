@@ -912,8 +912,7 @@ impl Session {
             if let Some(why) = st.held_by(draft_ok) {
                 return Some(why);
             }
-            let pid = self.child.as_ref().and_then(|c| c.claude);
-            return pid.and_then(|p| pi::work_in_children(p.as_raw() as u32, st.first_work)).map(|c| format!("running {c}"));
+            return None;
         }
         if !self.track_timers {
             return Some("--settings passed; cannot track timers".into());
